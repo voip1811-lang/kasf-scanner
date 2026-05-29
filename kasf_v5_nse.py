@@ -31,7 +31,8 @@ import pytz
 
 # Your existing Google Apps Script Web App URL (the one TradingView was posting to)
 # Find it in Google Script → Deploy → Manage Deployments → Web App URL
-GOOGLE_SHEET_WEBHOOK = "https://script.google.com/macros/s/1EqLjC0ifrvg770MSXUYvYeKj9orsCPKyR2DJtINusO8/exec"
+import os
+GOOGLE_SHEET_WEBHOOK = os.getenv("GOOGLE_SHEET_WEBHOOK", "")
 
 # ── KASF FILTER SETTINGS (matches Pine Script India values) ───────
 ATR_MULT       = 1.5     # ATR stop multiplier
