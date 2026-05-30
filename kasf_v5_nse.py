@@ -31,8 +31,7 @@ import pytz
 
 # Your existing Google Apps Script Web App URL (the one TradingView was posting to)
 # Find it in Google Script → Deploy → Manage Deployments → Web App URL
-import os
-GOOGLE_SHEET_WEBHOOK = os.getenv("GOOGLE_SHEET_WEBHOOK", "")
+GOOGLE_SHEET_WEBHOOK = "https://script.google.com/macros/s/1EqLjC0ifrvg770MSXUYvYeKj9orsCPKyR2DJtINusO8/exec"
 
 # ── KASF FILTER SETTINGS (matches Pine Script India values) ───────
 ATR_MULT       = 1.5     # ATR stop multiplier
@@ -488,33 +487,31 @@ def run_scan():
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION J — SCHEDULER
-# Runs scan every 15 minutes during market hours
+# SECTION J — CRON MODE (single run, then exit)
+# Railway triggers this every 15 min via cron: */15 3-10 * * 1-5
+# That covers 9:15 AM – 3:30 PM IST, Monday to Friday only.
+# No while loop needed — Railway handles the scheduling.
 # ──────────────────────────────────────────────────────────────────
 def main():
-    log.info("KASF V5 NSE Scanner started")
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+
+    log.info("KASF V5 NSE Scanner — cron run started")
+    log.info(f"Time            : {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
     log.info(f"Stocks to scan  : {len(NIFTY500_TICKERS)}")
-    log.info(f"Scan interval   : Every {SCAN_INTERVAL_MIN} minutes")
-    log.info(f"Market hours    : 9:15 AM – 3:15 PM IST, Mon–Fri")
     log.info(f"Volume filter   : {VOL_MULT}x 20-period average")
     log.info(f"RSI range       : {RSI_MIN} – {RSI_MAX}")
     log.info(f"Min R:R         : {MIN_RR}")
     log.info(f"Webhook target  : {GOOGLE_SHEET_WEBHOOK[:50]}...")
 
-    while True:
-        ist = pytz.timezone("Asia/Kolkata")
-        now = datetime.now(ist)
+    # Double-check market is open (safety net in case cron fires early/late)
+    if not is_market_open():
+        log.info(f"Market closed — {now.strftime('%H:%M IST')} — exiting")
+        return
 
-        if is_market_open():
-            if is_scheduled_time(now):
-                run_scan()
-            else:
-                log.info(f"Market open but outside scan window — {now.strftime('%H:%M IST')}")
-        else:
-            log.info(f"Market closed — {now.strftime('%H:%M IST')} | Next check in {SCAN_INTERVAL_MIN} min")
-
-        # Wait for next scan interval
-        time.sleep(SCAN_INTERVAL_MIN * 60)
+    # Run one full scan and exit
+    run_scan()
+    log.info("Cron run complete — exiting")
 
 
 if __name__ == "__main__":
