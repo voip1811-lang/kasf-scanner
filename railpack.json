@@ -1,0 +1,5 @@
+{
+  "deploy": {
+    "startCommand": "python kasf_v5_nse.py"
+  }
+}
