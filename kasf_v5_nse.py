@@ -1,26 +1,20 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          KASF V5 — NSE PYTHON SCANNER  (FIXED)                 ║
-║          Replaces TradingView completely. 100% Free.            ║
+║          KASF V5 — NSE PYTHON SCANNER  (V2 SMART SCHEDULE)     ║
 ║                                                                  ║
-║  FIX LOG vs previous version:                                    ║
-║   ✅ #3  VWAP rewritten — pandas 3.x safe (no groupby.apply)   ║
-║   ✅ #4  Scan window extended — 10:30–13:30 gap now covered     ║
-║   ✅ #5  Duplicate symbols removed (SUNPHARMA, TORNTPHARM etc)  ║
-║   ✅ #6  TITANCOMPANY → TITAN (correct NSE ticker)             ║
-║   ✅ #7  Wrong tickers fixed (BHARATFORG, CANFINHOME etc)       ║
-║   ✅ #8  Stock list expanded to ~480 real NIFTY 500 tickers     ║
-║   ✅ #9  vol_ok now setup-aware — PULLBACK/TREND no surge req'd ║
-║   ✅ #10 entry_gap_pct clamped to 0 minimum                     ║
-║   ✅ #11 Stock list shuffled each run — fair scan distribution  ║
-║   ✅ #12 Batch yf.download — fewer HTTP requests, faster scan   ║
-║   ✅ #14 Log rotation added — max 5MB × 3 files                 ║
-║   ✅ #1  Webhook URL via env var GOOGLE_SHEET_WEBHOOK           ║
-║   ✅ #2  index sentiment column rename made consistent           ║
+║  SCHEDULE — 5 slots only, hardcoded in Python:                  ║
+║                                                                  ║
+║   9:15 AM IST → ENTRY SCAN  (full scan + Gemini + Telegram)    ║
+║   9:30 AM IST → ENTRY SCAN  (full scan + Gemini + Telegram)    ║
+║  10:00 AM IST → ENTRY SCAN  (full scan + Gemini + Telegram)    ║
+║   2:30 PM IST → EXIT WARNING (Telegram only — zero tokens)     ║
+║   3:15 PM IST → FINAL EXIT  (Telegram only — zero tokens)      ║
+║                                                                  ║
+║  All other cron fires → script exits in <1 second              ║
+║  Railway cron stays: */15 3-10 * * 1-5                         ║
+║                                                                  ║
+║  TOKEN SAVINGS: ~87% vs previous version                        ║
 ╚══════════════════════════════════════════════════════════════════╝
-
-Railway cron: */15 3-10 * * 1-5
-Each run: fetches data → scans → posts signals → exits
 """
 
 import os
@@ -37,40 +31,47 @@ import pytz
 
 # ──────────────────────────────────────────────────────────────────
 # SECTION A — CONFIGURATION
-# Set GOOGLE_SHEET_WEBHOOK as an environment variable in Railway.
-# Dashboard → your service → Variables → Add Variable
 # ──────────────────────────────────────────────────────────────────
-
-# ✅ FIX #1 — URL from env variable, not hardcoded
 GOOGLE_SHEET_WEBHOOK = os.environ.get(
     "GOOGLE_SHEET_WEBHOOK",
     "https://script.google.com/macros/s/1EqLjC0ifrvg770MSXUYvYeKj9orsCPKyR2DJtINusO8/exec"
-    # ↑ fallback kept so existing deploy doesn't break immediately
-    # But set the env var in Railway and remove this fallback later
 )
 
-# ── KASF FILTER SETTINGS (matches Pine Script India values) ───────
-ATR_MULT  = 1.5    # ATR stop multiplier
-MIN_RR    = 1.5    # Minimum Risk:Reward ratio
-RSI_MIN   = 40     # RSI oversold floor
-RSI_MAX   = 74     # RSI overbought ceiling (India)
-VOL_MULT  = 2.0    # Volume surge multiplier for BREAKOUT (India = 2.0x)
-PULL_PCT  = 0.003  # Pullback % from S1 (India = 0.3%)
-MAX_PICKS = 4      # Max signals posted per scan run
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")   # set in Railway Variables
+CHAT_ID   = os.environ.get("CHAT_ID",   "")   # set in Railway Variables
+
+# ── KASF FILTER SETTINGS ──────────────────────────────────────────
+ATR_MULT  = 1.5
+MIN_RR    = 2.0    # raised from 1.5 → fewer, higher quality signals
+RSI_MIN   = 45     # raised from 40  → stronger momentum only
+RSI_MAX   = 70     # lowered from 74 → avoid overbought entries
+VOL_MULT  = 2.0    # BREAKOUT volume multiplier
+PULL_PCT  = 0.003
+MAX_PICKS = 3      # max 3 signals per entry scan
 
 # ── SCANNER SETTINGS ──────────────────────────────────────────────
-CANDLE_INTERVAL   = "15m"
-HISTORY_PERIOD    = "5d"
-BATCH_SIZE        = 10    # stocks per yf.download batch call
-BATCH_DELAY_SEC   = 1.5   # wait between batches (rate limiting)
+CANDLE_INTERVAL = "15m"
+HISTORY_PERIOD  = "5d"
+BATCH_SIZE      = 10
+BATCH_DELAY_SEC = 1.5
+
+# ── TIME SLOTS (IST) ──────────────────────────────────────────────
+# Each slot: (hour, minute, type)
+# type = "ENTRY" → full scan + post to sheet
+# type = "EXIT"  → Telegram warning only, no scan, zero tokens
+# tolerance = ±7 min window around each slot
+SCAN_SLOTS = [
+    (9,  15, "ENTRY"),   # 9:15 AM  — opening scan
+    (9,  30, "ENTRY"),   # 9:30 AM  — confirmation scan
+    (10,  0, "ENTRY"),   # 10:00 AM — final entry scan
+    (14, 30, "EXIT"),    # 2:30 PM  — exit warning
+    (15, 15, "EXIT"),    # 3:15 PM  — final exit alert
+]
+SLOT_TOLERANCE_MIN = 7   # fire if within ±7 min of slot time
 
 
 # ──────────────────────────────────────────────────────────────────
 # SECTION B — NIFTY 500 STOCK LIST
-# ✅ FIX #5 — duplicates removed
-# ✅ FIX #6 — TITANCOMPANY → TITAN
-# ✅ FIX #7 — all wrong tickers corrected to real NSE symbols
-# ✅ FIX #8 — expanded to ~480 verified NIFTY 500 constituents
 # ──────────────────────────────────────────────────────────────────
 NIFTY500_SYMBOLS = [
     # ── NIFTY 50 ──────────────────────────────────────────────────
@@ -119,50 +120,40 @@ NIFTY500_SYMBOLS = [
     "DELHIVERY","LALPATHLAB","JKCEMENT","ACC","AMBUJA","RAMCOCEM",
     "HEIDELBERGCEM","JUSTDIAL","NAUKRI","INFOEDGE","POLICYBZR",
     "ANGELONE","IIFL","EDELWEISS","MOTILALOFS","CDSL","CAMS",
-    "JMFINANCIAL","GEOJITFSL","IFCI","SOBHA","KOLTEPATIL",
+    "JMFINANCIAL","GEOJITFSL","SOBHA","KOLTEPATIL",
     "SUNTV","NETWORK18","TV18BRDCST","UNOMINDA","SANDHAR","SUBROS",
     "JAMNAUTO","MOTHERSON","KRBL","LTFOODS","DODLA",
 
-    # ── NIFTY SMALLCAP 250 (selected liquid names) ────────────────
-    "FINEORG","GALAXYSURF","VINATIORGA","CLEAN","AAPL",
+    # ── NIFTY SMALLCAP (liquid names) ─────────────────────────────
     "HAPPSTMNDS","BIRLASOFT","CYIENT","SONACOMS","SANSERA",
-    "TITAGARH","TEXRAIL","IREDA","JYOTHYLAB","HATSUN",
-    "WOCKPHARMA","STRIDES","ERIS","GLENMARK","TORNTPOWER",
-    "INOXWIND","SUZLON","ORIENTELEC","FINOLEX","POLYCAB",
-    "KEI","RCF","NFL","GSFC","UFLEX","ASTRAL","SUPREME",
-    "BALAMINES","CHEMPLASTS","IOLCP","ALKYLAMINE","FLUOROCHEM",
-    "PGHL","PGHH","GILLETTE","COLPAL","HSCL","JKLAKSHMI",
-    "NCLIND","STARCEMENT","BIRLACORPN","PRISM","SHREECEM",
-    "AIAENG","GREAVESCOT","IFBIND","SUPRAJIT","MNRINDIA",
-    "GPPL","WABAG","INOX","ZEEL","NAZARA","ONMOBILE",
-    "VSTIND","GREAVES","SAFARI","VGUARD","PGEL","VOLTAMP",
-    "TDPOWERSYS","SKIPPER","RATNAMANI","WELCORP","MAHSEAMLES",
-    "JINDALPOLY","JINDALSAW","JSPL","HINDBIOSCI","SEQUENT",
-    "SATIN","ARMAN","FUSION","CREDITACC","IDFC","IIFLWAM",
-    "CHOICEIN","5PAISA","MATRIMONY","PAYTM","NSDL",
-    "ABIRLANUVO","GATI","VRL","TCI","MAHLOG","BLUEDART",
-    "RBLBANK","BANDHANBNK","DCBBANK","SOUTHBANK","KTKBANK",
-    "KARNATAKA","LAKSHVILAS","CSBBANK","UJJIVANSFB",
-    "MANAPPURAM","IIFLHFL","APTUS","HOMEFIRST","AAVAS",
+    "TITAGARH","IREDA","JYOTHYLAB","HATSUN","WOCKPHARMA",
+    "STRIDES","ERIS","GLENMARK","INOXWIND","SUZLON",
+    "ORIENTELEC","POLYCAB","KEI","GSFC","ASTRAL","SUPREME",
+    "BALAMINES","CHEMPLASTS","ALKYLAMINE","FLUOROCHEM",
+    "PGHL","GILLETTE","COLPAL","JKLAKSHMI","STARCEMENT",
+    "BIRLACORPN","SHREECEM","AIAENG","SUPRAJIT","MNRINDIA",
+    "WABAG","NAZARA","VSTIND","SAFARI","VGUARD","VOLTAMP",
+    "RATNAMANI","WELCORP","JSPL","SEQUENT","SATIN","ARMAN",
+    "FUSION","CREDITACC","IDFC","CHOICEIN","PAYTM",
+    "GATI","VRL","TCI","BLUEDART","RBLBANK","BANDHANBNK",
+    "DCBBANK","MANAPPURAM","FINEORG","VINATIORGA","POLYPLEX",
 ]
 
-# ✅ FIX #5 — deduplicate preserving order
 NIFTY500_SYMBOLS = list(dict.fromkeys(NIFTY500_SYMBOLS))
 NIFTY500_TICKERS = [s + ".NS" for s in NIFTY500_SYMBOLS]
 
 
 # ──────────────────────────────────────────────────────────────────
 # SECTION C — LOGGING
-# ✅ FIX #14 — RotatingFileHandler (5MB × 3 files, not unlimited)
 # ──────────────────────────────────────────────────────────────────
 def setup_logging():
-    fmt     = "%(asctime)s | %(levelname)s | %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
+    fmt      = "%(asctime)s | %(levelname)s | %(message)s"
+    datefmt  = "%Y-%m-%d %H:%M:%S"
     handlers = [
         logging.StreamHandler(),
         RotatingFileHandler(
             "kasf_scanner.log",
-            maxBytes    = 5 * 1024 * 1024,  # 5 MB
+            maxBytes    = 5 * 1024 * 1024,
             backupCount = 3,
             encoding    = "utf-8"
         )
@@ -175,69 +166,106 @@ log = logging.getLogger("KASF")
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION D — MARKET HOURS
+# SECTION D — SLOT DETECTION
+# Checks current IST time against the 5 defined slots
+# Returns ("ENTRY"/"EXIT", slot_label) or (None, None)
 # ──────────────────────────────────────────────────────────────────
-def is_market_open() -> bool:
-    """True only during NSE hours 9:15–15:15 IST, Mon–Fri."""
+def get_current_slot() -> tuple[str | None, str | None]:
+    """
+    Matches current IST time to one of the 5 defined slots.
+    Returns (slot_type, label) or (None, None) if no match.
+    Tolerance = ±SLOT_TOLERANCE_MIN minutes around each slot.
+    """
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist)
+
+    # Weekend — always skip
     if now.weekday() >= 5:
-        return False
-    open_t  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    close_t = now.replace(hour=15, minute=15, second=0, microsecond=0)
-    return open_t <= now <= close_t
+        return None, None
 
+    now_minutes = now.hour * 60 + now.minute
 
-# ✅ FIX #4 — removed 3-hour dead gap; now covers full trading day
-# Old windows: 9:15–10:30 | 13:30–14:45 | 15:00–15:15  (gap: 10:31–13:29)
-# New windows: 9:15–15:15  (continuous — Railway cron already controls timing)
-def is_scheduled_time(now_ist: datetime) -> bool:
-    """
-    Covers the full NSE session 9:15–15:15.
-    Railway cron */15 3-10 UTC fires every 15 min in this window.
-    No need to further restrict here — every cron fire should scan.
-    """
-    h, m = now_ist.hour, now_ist.minute
-    after_open  = (h > 9) or (h == 9 and m >= 15)
-    before_close = (h < 15) or (h == 15 and m <= 15)
-    return after_open and before_close
+    for (slot_h, slot_m, slot_type) in SCAN_SLOTS:
+        slot_minutes = slot_h * 60 + slot_m
+        diff = abs(now_minutes - slot_minutes)
+        if diff <= SLOT_TOLERANCE_MIN:
+            label = f"{slot_h:02d}:{slot_m:02d} IST"
+            return slot_type, label
+
+    return None, None
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION E — DATA FETCH
-# ✅ FIX #12 — batch download (BATCH_SIZE tickers per HTTP call)
-# ✅ FIX #2  — consistent lowercase column names everywhere
+# SECTION E — TELEGRAM DIRECT SENDER
+# Used for EXIT alerts — bypasses Google Sheet entirely
+# No Gemini tokens consumed
+# ──────────────────────────────────────────────────────────────────
+def send_telegram_exit_alert(slot_label: str, is_final: bool):
+    """
+    Sends exit warning directly to Telegram.
+    Zero Google Sheet calls. Zero Gemini tokens.
+    """
+    if not BOT_TOKEN or not CHAT_ID:
+        log.warning("BOT_TOKEN or CHAT_ID not set — cannot send exit alert directly")
+        log.info("Exit alert would have been sent to Telegram")
+        return
+
+    if is_final:
+        msg = (
+            "🚨 <b>KASF — FINAL EXIT ALERT</b> 🚨\n"
+            "⏰ Time: <b>3:15 PM IST</b>\n\n"
+            "🛑 <b>EXIT ALL INTRADAY POSITIONS NOW!</b>\n"
+            "NSE market closes in 15 minutes.\n\n"
+            "✅ Book profits on all open trades.\n"
+            "✅ Do not carry intraday positions overnight.\n\n"
+            "⚠️ <i>KASF Auto-Alert — No new entries after this.</i>"
+        )
+    else:
+        msg = (
+            "⚠️ <b>KASF — EXIT WARNING</b> ⚠️\n"
+            "⏰ Time: <b>2:30 PM IST</b>\n\n"
+            "📢 Market closes in <b>45 minutes</b>.\n\n"
+            "🔍 Review all open intraday positions.\n"
+            "💰 Consider booking partial profits now.\n"
+            "🛑 Plan your exits before 3:15 PM IST.\n\n"
+            "⚠️ <i>KASF Auto-Alert — Next alert at 3:15 PM.</i>"
+        )
+
+    try:
+        url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        resp = requests.post(url, json={
+            "chat_id":    CHAT_ID,
+            "text":       msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
+        if resp.ok:
+            log.info(f"✅ Exit alert sent to Telegram — {slot_label}")
+        else:
+            log.warning(f"Telegram send failed: {resp.text[:100]}")
+    except Exception as e:
+        log.error(f"Telegram send error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────
+# SECTION F — DATA FETCH
 # ──────────────────────────────────────────────────────────────────
 def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Flatten MultiIndex and lowercase all column names."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.columns = [c.lower() for c in df.columns]
     return df
 
 
-def fetch_batch_15m(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """
-    Download 15-min data for a batch of tickers in one HTTP call.
-    Returns {ticker: DataFrame} — missing/failed tickers omitted.
-    """
+def fetch_batch_15m(tickers: list) -> dict:
     try:
         raw = yf.download(
-            tickers,
-            period      = HISTORY_PERIOD,
-            interval    = CANDLE_INTERVAL,
-            progress    = False,
-            auto_adjust = True,
-            group_by    = "ticker"
+            tickers, period=HISTORY_PERIOD, interval=CANDLE_INTERVAL,
+            progress=False, auto_adjust=True, group_by="ticker"
         )
         result = {}
         for ticker in tickers:
             try:
-                if len(tickers) == 1:
-                    df = raw.copy()
-                else:
-                    df = raw[ticker].copy()
-
+                df = raw.copy() if len(tickers) == 1 else raw[ticker].copy()
                 df = _normalise_columns(df)
                 needed = [c for c in ["open","high","low","close","volume"] if c in df.columns]
                 if len(needed) < 5:
@@ -253,25 +281,16 @@ def fetch_batch_15m(tickers: list[str]) -> dict[str, pd.DataFrame]:
         return {}
 
 
-def fetch_batch_daily(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """Download daily data for pivot points and ATR."""
+def fetch_batch_daily(tickers: list) -> dict:
     try:
         raw = yf.download(
-            tickers,
-            period      = "15d",
-            interval    = "1d",
-            progress    = False,
-            auto_adjust = True,
-            group_by    = "ticker"
+            tickers, period="15d", interval="1d",
+            progress=False, auto_adjust=True, group_by="ticker"
         )
         result = {}
         for ticker in tickers:
             try:
-                if len(tickers) == 1:
-                    df = raw.copy()
-                else:
-                    df = raw[ticker].copy()
-
+                df = raw.copy() if len(tickers) == 1 else raw[ticker].copy()
                 df = _normalise_columns(df)
                 needed = [c for c in ["open","high","low","close","volume"] if c in df.columns]
                 if len(needed) < 5:
@@ -288,14 +307,10 @@ def fetch_batch_daily(tickers: list[str]) -> dict[str, pd.DataFrame]:
 
 
 def fetch_index_sentiment() -> str:
-    """
-    NIFTY index: close > EMA20 → BULLISH else BEARISH.
-    ✅ FIX #2 — consistent lowercase after normalise.
-    """
     try:
         raw = yf.download("^NSEI", period="30d", interval="1d",
                           progress=False, auto_adjust=True)
-        df = _normalise_columns(raw)
+        df  = _normalise_columns(raw)
         if df.empty or len(df) < 21:
             return "Neutral"
         c     = df["close"]
@@ -309,7 +324,7 @@ def fetch_index_sentiment() -> str:
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION F — INDICATORS
+# SECTION G — INDICATORS
 # ──────────────────────────────────────────────────────────────────
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
@@ -326,19 +341,14 @@ def calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
 
 def calc_vwap(df: pd.DataFrame) -> pd.Series:
-    """
-    Session VWAP resetting each day — matches Pine Script ta.vwap.
-    ✅ FIX #3 — rewritten using groupby().cumsum() only (no .apply).
-    This is fully safe in pandas 2.x and 3.x.
-    """
-    df2         = df.copy()
-    df2["date"] = df2.index.date
-    df2["hlc3"] = (df2["high"] + df2["low"] + df2["close"]) / 3
-    df2["pv"]   = df2["hlc3"] * df2["volume"]
+    """Session VWAP — resets daily. pandas 3.x safe."""
+    df2          = df.copy()
+    df2["date"]  = df2.index.date
+    df2["hlc3"]  = (df2["high"] + df2["low"] + df2["close"]) / 3
+    df2["pv"]    = df2["hlc3"] * df2["volume"]
     df2["cum_pv"]  = df2.groupby("date")["pv"].cumsum()
     df2["cum_vol"] = df2.groupby("date")["volume"].cumsum()
-    vwap = df2["cum_pv"] / df2["cum_vol"]
-    return vwap
+    return df2["cum_pv"] / df2["cum_vol"]
 
 
 def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -350,7 +360,6 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def calc_pivot_points(daily_df: pd.DataFrame):
-    """Previous day H/L/C → classic pivot points."""
     prev  = daily_df.iloc[-2]
     H, L, C = float(prev["high"]), float(prev["low"]), float(prev["close"])
     pivot = (H + L + C) / 3
@@ -362,9 +371,7 @@ def calc_pivot_points(daily_df: pd.DataFrame):
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION G — SIGNAL GENERATION
-# ✅ FIX #9  — vol_ok is setup-aware (PULLBACK/TREND ≠ BREAKOUT)
-# ✅ FIX #10 — entry_gap_pct clamped to ≥ 0
+# SECTION H — SIGNAL GENERATION
 # ──────────────────────────────────────────────────────────────────
 def generate_signal(symbol: str,
                     df_15m: pd.DataFrame,
@@ -379,11 +386,9 @@ def generate_signal(symbol: str,
         rsi     = calc_rsi(close, 14)
         vwap    = calc_vwap(df_15m)
         vol_avg = volume.rolling(20).mean()
-        high_20 = high.shift(1).rolling(20).max()   # highest(high,20)[1]
-
+        high_20 = high.shift(1).rolling(20).max()
         daily_atr = float(calc_atr(df_daily, 14).iloc[-1])
 
-        # Latest bar values
         c        = float(close.iloc[-1])
         v        = float(volume.iloc[-1])
         e20      = float(ema20.iloc[-1])
@@ -393,14 +398,11 @@ def generate_signal(symbol: str,
         vol_a    = float(vol_avg.iloc[-1])
         h20      = float(high_20.iloc[-1])
 
-        # Guard against NaN from indicators
         if any(np.isnan(x) for x in [e20, e50, rsi_val, vwap_val, vol_a, h20, daily_atr]):
             return None
 
-        # Pivot points
         _, r1, r2, s1, s2 = calc_pivot_points(df_daily)
 
-        # ── Setup classification ───────────────────────────────────
         breakout    = (c > h20) and (v > vol_a * VOL_MULT)
         is_pullback = (abs(c - s1) / c) < PULL_PCT
 
@@ -411,12 +413,10 @@ def generate_signal(symbol: str,
         else:
             setup_type = "TREND"
 
-        # ── Stops ─────────────────────────────────────────────────
         sl1       = s1
         sl2       = c - (daily_atr * ATR_MULT)
         actual_sl = max(sl1, sl2)
 
-        # ── Entry ─────────────────────────────────────────────────
         if is_pullback:
             entry = s1
         elif breakout:
@@ -424,26 +424,22 @@ def generate_signal(symbol: str,
         else:
             entry = vwap_val if abs(c - vwap_val) < abs(c - e20) else e20
 
-        # ✅ FIX #10 — clamp to 0 (negative gap = price below entry, skip)
         entry_gap_pct = max(0.0, ((c - entry) / entry * 100)) if entry > 0 else 0.0
 
-        # ── R:R ───────────────────────────────────────────────────
         rr_denom = entry - actual_sl
         if rr_denom <= 0:
             return None
         rr = (r1 - entry) / rr_denom
 
-        # ── Quality filters ───────────────────────────────────────
         trend_ok = (c > e20) and (c > e50)
         rsi_ok   = RSI_MIN < rsi_val < RSI_MAX
 
-        # ✅ FIX #9 — volume requirement is setup-specific
         if setup_type == "BREAKOUT":
-            vol_ok = v > vol_a * VOL_MULT        # strong surge 2.0x
+            vol_ok = v > vol_a * VOL_MULT
         elif setup_type == "PULLBACK":
-            vol_ok = v > vol_a * 0.8             # just needs some volume
-        else:  # TREND
-            vol_ok = v > vol_a * 1.2             # slight above average
+            vol_ok = v > vol_a * 0.8
+        else:
+            vol_ok = v > vol_a * 1.2
 
         setup_ok = breakout or is_pullback or (c > vwap_val)
         valid    = trend_ok and rsi_ok and vol_ok and setup_ok
@@ -463,7 +459,7 @@ def generate_signal(symbol: str,
             "sl2":           round(sl2, 4),
             "setup":         setup_type,
             "rr":            round(rr, 2),
-            "index":         "BULLISH",   # overwritten by caller
+            "index":         "BULLISH",
         }
 
     except Exception as e:
@@ -472,7 +468,7 @@ def generate_signal(symbol: str,
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION H — POST TO GOOGLE SHEET
+# SECTION I — POST TO GOOGLE SHEET
 # ──────────────────────────────────────────────────────────────────
 def post_to_sheet(payload: dict) -> bool:
     try:
@@ -492,37 +488,28 @@ def post_to_sheet(payload: dict) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION I — MAIN SCAN
-# ✅ FIX #11 — list shuffled each run for fair coverage
-# ✅ FIX #12 — batch fetch (BATCH_SIZE per HTTP call)
+# SECTION J — ENTRY SCAN
 # ──────────────────────────────────────────────────────────────────
-def run_scan(index_sentiment: str) -> int:
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.now(ist)
-
+def run_entry_scan(slot_label: str, index_sentiment: str) -> int:
     log.info("=" * 62)
-    log.info(f"KASF SCAN START — {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
-    log.info(f"Stocks in list  : {len(NIFTY500_TICKERS)}")
-    log.info(f"Batch size      : {BATCH_SIZE} per HTTP call")
-    log.info(f"Index sentiment : {index_sentiment}")
+    log.info(f"ENTRY SCAN — {slot_label}")
+    log.info(f"Stocks        : {len(NIFTY500_TICKERS)}")
+    log.info(f"Index         : {index_sentiment}")
+    log.info(f"Filters       : RR≥{MIN_RR} | RSI {RSI_MIN}–{RSI_MAX} | Vol {VOL_MULT}x")
 
-    # ✅ FIX #11 — shuffle so different stocks get priority each run
     tickers = NIFTY500_TICKERS.copy()
-    random.shuffle(tickers)
+    random.shuffle(tickers)   # fair coverage every run
 
     signals_found  = 0
     signals_posted = 0
     errors         = 0
 
-    # Process in batches
     for batch_start in range(0, len(tickers), BATCH_SIZE):
         if signals_posted >= MAX_PICKS:
-            log.info(f"MAX_PICKS ({MAX_PICKS}) reached — stopping scan")
+            log.info(f"MAX_PICKS ({MAX_PICKS}) reached — stopping")
             break
 
-        batch = tickers[batch_start : batch_start + BATCH_SIZE]
-
-        # Fetch 15m + daily for entire batch in 2 HTTP calls
+        batch      = tickers[batch_start : batch_start + BATCH_SIZE]
         data_15m   = fetch_batch_15m(batch)
         data_daily = fetch_batch_daily(batch)
 
@@ -530,7 +517,7 @@ def run_scan(index_sentiment: str) -> int:
             if signals_posted >= MAX_PICKS:
                 break
 
-            symbol = ticker.replace(".NS", "")
+            symbol   = ticker.replace(".NS", "")
             df_15m   = data_15m.get(ticker)
             df_daily = data_daily.get(ticker)
 
@@ -539,62 +526,60 @@ def run_scan(index_sentiment: str) -> int:
                 continue
 
             signal = generate_signal(symbol, df_15m, df_daily)
-
             if signal:
                 signal["index"] = index_sentiment
                 signals_found  += 1
                 log.info(
-                    f"✅ SIGNAL: {symbol:15s} | {signal['setup']:8s} "
+                    f"✅ {symbol:15s} | {signal['setup']:8s} "
                     f"| R:R={signal['rr']:4.2f} | Entry=₹{signal['entry']}"
                 )
-
                 if post_to_sheet(signal):
                     signals_posted += 1
-                    log.info(f"   → Posted to Google Sheet ✓")
+                    log.info(f"   → Sheet ✓")
                 else:
-                    log.warning(f"   → Post FAILED ✗")
+                    log.warning(f"   → Sheet FAILED ✗")
 
-        batch_num = (batch_start // BATCH_SIZE) + 1
+        batch_num     = (batch_start // BATCH_SIZE) + 1
         total_batches = (len(tickers) + BATCH_SIZE - 1) // BATCH_SIZE
-        log.info(
-            f"Batch {batch_num}/{total_batches} done "
-            f"| Signals so far: {signals_found} | Posted: {signals_posted}"
-        )
+        log.info(f"Batch {batch_num}/{total_batches} | Signals: {signals_found} | Posted: {signals_posted}")
         time.sleep(BATCH_DELAY_SEC)
 
-    log.info(
-        f"SCAN COMPLETE — Signals: {signals_found} | "
-        f"Posted: {signals_posted} | Errors: {errors}"
-    )
+    log.info(f"SCAN DONE — Signals: {signals_found} | Posted: {signals_posted} | Errors: {errors}")
     log.info("=" * 62)
     return signals_posted
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION J — ENTRY POINT (cron mode — run once, exit)
-# Railway cron: */15 3-10 * * 1-5
+# SECTION K — MAIN ENTRY POINT
 # ──────────────────────────────────────────────────────────────────
 def main():
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist)
 
-    log.info("KASF V5 NSE Scanner — cron run started")
-    log.info(f"Time   : {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
-    log.info(f"Webhook: {GOOGLE_SHEET_WEBHOOK[:60]}...")
+    log.info(f"KASF V5 — cron fire at {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
-    # Safety guard (Railway cron covers 8:30–16:29 IST; NSE is 9:15–15:15)
-    if not is_market_open():
-        log.info(f"Market closed at {now.strftime('%H:%M IST')} — nothing to do, exiting")
+    # ── Step 1: Which slot are we in? ─────────────────────────────
+    slot_type, slot_label = get_current_slot()
+
+    if slot_type is None:
+        log.info(f"No active slot at {now.strftime('%H:%M IST')} — exiting (0 tokens used)")
         return
 
-    if not is_scheduled_time(now):
-        log.info(f"Outside scan window at {now.strftime('%H:%M IST')} — exiting")
+    log.info(f"Matched slot: {slot_label} → {slot_type}")
+
+    # ── Step 2: EXIT slot → direct Telegram, no scan, no tokens ──
+    if slot_type == "EXIT":
+        is_final = (now.hour == 15)   # 3:15 PM = final exit
+        send_telegram_exit_alert(slot_label, is_final)
+        log.info("Exit alert sent — exiting (0 Gemini tokens used)")
         return
 
-    # Fetch index sentiment once, then scan
-    index_sentiment = fetch_index_sentiment()
-    run_scan(index_sentiment)
-    log.info("Cron run complete — exiting")
+    # ── Step 3: ENTRY slot → full scan ────────────────────────────
+    if slot_type == "ENTRY":
+        index_sentiment = fetch_index_sentiment()
+        run_entry_scan(slot_label, index_sentiment)
+        log.info("Entry scan complete — exiting")
+        return
 
 
 if __name__ == "__main__":
