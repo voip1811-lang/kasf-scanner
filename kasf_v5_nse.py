@@ -60,6 +60,7 @@ SCAN_SLOTS = [
     (9,  15, "ENTRY"),
     (9,  30, "ENTRY"),
     (10,  0, "ENTRY"),
+    (13, 30, "ENTRY"),   # ← 1:30 PM added
     (14, 30, "EXIT"),
     (15, 15, "EXIT"),
 ]
