@@ -1,8 +1,6 @@
-# KASF V5 NSE Scanner — Requirements
-# Install with: pip install -r requirements.txt
-
-yfinance>=0.2.38        # NSE live data (free, no API key)
-pandas>=2.0.0           # Data processing
-numpy>=1.26.0           # Math calculations
-requests>=2.31.0        # HTTP posting to Google Sheet
-pytz>=2024.1            # IST timezone handling
+fyers-apiv3
+pandas
+numpy
+requests
+pyotp
+pytz
