@@ -1,34 +1,56 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║       KASF V5 — NSE SCANNER  (V3 — TICKER CLEAN + BEARISH FIX) ║
+║       KASF V5 — NSE SCANNER  (V4 — FYERS API EDITION)          ║
 ║                                                                  ║
-║  CHANGES vs V2:                                                  ║
-║   ✅ All 40 bad tickers fixed/removed from stock list           ║
-║   ✅ BEARISH market no longer blocks signals                     ║
-║      → Index sentiment is INFO ONLY in the alert               ║
-║      → Individual stock quality decides entry, not index        ║
-║   ✅ Bearish market → Telegram notification sent first          ║
+║  CHANGES vs V3:                                                  ║
+║   ✅ yfinance REMOVED — replaced with Fyers API v3              ║
+║   ✅ TOTP auto-login — fully headless, no browser needed        ║
+║   ✅ Token generated once at startup, reused all day            ║
+║   ✅ Symbol format: RELIANCE → NSE:RELIANCE-EQ                  ║
+║   ✅ Index: ^NSEI → NSE:NIFTY50-INDEX                           ║
+║   ✅ Telegram alert if login fails (so you know fast)           ║
 ║                                                                  ║
-║  SCHEDULE (5 slots — hardcoded):                                ║
+║  RAILWAY ENV VARS REQUIRED:                                      ║
+║   FYERS_APP_ID      → e.g. "L9NY305RTW"  (without -100)        ║
+║   FYERS_SECRET_KEY  → from Fyers API dashboard                  ║
+║   FYERS_FY_ID       → your Fyers login ID  e.g. "XK01234"      ║
+║   FYERS_PIN         → your 4-digit Fyers PIN                    ║
+║   FYERS_TOTP_KEY    → 32-char key from Fyers 2FA setup          ║
+║   FYERS_REDIRECT_URI→ redirect URL set in your Fyers app        ║
+║   BOT_TOKEN         → Telegram bot token                        ║
+║   CHAT_ID           → Telegram chat ID                          ║
+║   GOOGLE_SHEET_WEBHOOK → Google Apps Script URL                 ║
+║                                                                  ║
+║  SCHEDULE (6 slots — hardcoded):                                ║
+║   9:00 AM → TOKEN GEN (runs first, before market)              ║
 ║   9:15 AM → ENTRY SCAN                                         ║
 ║   9:30 AM → ENTRY SCAN                                         ║
 ║  10:00 AM → ENTRY SCAN                                         ║
-║   2:30 PM → EXIT WARNING (direct Telegram, 0 tokens)           ║
-║   3:15 PM → FINAL EXIT   (direct Telegram, 0 tokens)           ║
+║   1:30 PM → ENTRY SCAN                                         ║
+║   2:30 PM → EXIT WARNING                                       ║
+║   3:15 PM → FINAL EXIT                                         ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
 import os
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import requests
+import json
+import base64
 import time
 import logging
 import random
+import sys
+import requests
+import pyotp
+import pandas as pd
+import numpy as np
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 import pytz
+
+# fyers_apiv3 must be installed: pip install fyers-apiv3
+from fyers_apiv3 import fyersModel
+
 
 # ──────────────────────────────────────────────────────────────────
 # SECTION A — CONFIGURATION
@@ -40,6 +62,27 @@ GOOGLE_SHEET_WEBHOOK = os.environ.get(
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = os.environ.get("CHAT_ID",   "")
 
+# ── FYERS CREDENTIALS (from Railway env vars) ─────────────────────
+FYERS_APP_ID       = os.environ.get("FYERS_APP_ID",       "")   # e.g. "L9NY305RTW"
+FYERS_APP_TYPE     = "100"                                        # always 100 for web
+FYERS_SECRET_KEY   = os.environ.get("FYERS_SECRET_KEY",   "")
+FYERS_FY_ID        = os.environ.get("FYERS_FY_ID",        "")   # Fyers client ID / login
+FYERS_PIN          = os.environ.get("FYERS_PIN",          "")   # 4-digit PIN as string
+FYERS_TOTP_KEY     = os.environ.get("FYERS_TOTP_KEY",     "")   # 32-char TOTP secret
+FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI", "https://trade.fyers.in/api-login/redirect-uri/index.html")
+
+# Fyers client_id format is "APPID-100"
+FYERS_CLIENT_ID = f"{FYERS_APP_ID}-{FYERS_APP_TYPE}"
+
+# ── FYERS API ENDPOINTS ───────────────────────────────────────────
+_BASE_VAGATOR  = "https://api-t2.fyers.in/vagator/v2"
+_BASE_API      = "https://api-t1.fyers.in/api/v3"
+URL_SEND_OTP   = _BASE_VAGATOR + "/send_login_otp"
+URL_VERIFY_OTP = _BASE_VAGATOR + "/verify_otp"
+URL_VERIFY_PIN = _BASE_VAGATOR + "/verify_pin"
+URL_TOKEN      = _BASE_API    + "/token"
+URL_AUTH_CODE  = _BASE_API    + "/validate-authcode"
+
 # ── KASF FILTER SETTINGS ──────────────────────────────────────────
 ATR_MULT  = 1.5
 MIN_RR    = 2.0
@@ -50,28 +93,33 @@ PULL_PCT  = 0.003
 MAX_PICKS = 3
 
 # ── SCANNER SETTINGS ──────────────────────────────────────────────
-CANDLE_INTERVAL = "15m"
-HISTORY_PERIOD  = "5d"
-BATCH_SIZE      = 10
-BATCH_DELAY_SEC = 1.5
+CANDLE_INTERVAL  = "15"     # Fyers: "15" = 15-minute candles
+DAILY_INTERVAL   = "D"      # Fyers: "D"  = daily candles
+HISTORY_DAYS_15M = 5        # days of 15m history
+HISTORY_DAYS_D   = 15       # days of daily history
+BATCH_SIZE       = 10
+BATCH_DELAY_SEC  = 1.5
 
 # ── TIME SLOTS ────────────────────────────────────────────────────
 SCAN_SLOTS = [
+    (9,   0, "TOKEN"),    # token generation — must run before any scan
     (9,  15, "ENTRY"),
     (9,  30, "ENTRY"),
     (10,  0, "ENTRY"),
-    (13, 30, "ENTRY"),   # ← 1:30 PM added
+    (13, 30, "ENTRY"),
     (14, 30, "EXIT"),
     (15, 15, "EXIT"),
 ]
 SLOT_TOLERANCE_MIN = 7
 
+# ── TOKEN CACHE (in-memory for the day) ───────────────────────────
+_fyers_instance = None   # fyersModel.FyersModel — set after login
+
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION B — CLEAN NIFTY 500 STOCK LIST
-# All tickers verified against NSE / Yahoo Finance
+# SECTION B — NSE SYMBOL LIST  (Fyers format: NSE:SYMBOL-EQ)
 # ──────────────────────────────────────────────────────────────────
-NIFTY500_SYMBOLS = [
+_RAW_SYMBOLS = [
     # ── NIFTY 50 ──────────────────────────────────────────────────
     "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFY","SBIN",
     "HINDUNILVR","ITC","LT","BAJFINANCE","HCLTECH","KOTAKBANK","MARUTI",
@@ -89,8 +137,7 @@ NIFTY500_SYMBOLS = [
     "SAIL","NMDC","GAIL","PETRONET","CONCOR","IRFC","PFC","RECLTD",
     "NHPC","SJVN","TATAPOWER","ADANIGREEN","ADANIPOWER","TORNTPOWER",
     "CESC","TATACOMM","MPHASIS","LTTS","PERSISTENT","COFORGE","ZOMATO",
-    "ETERNAL","NYKAA","DMART","TRENT","ABFRL","VBL","UBL",
-    "RADICO",
+    "ETERNAL","NYKAA","DMART","TRENT","ABFRL","VBL","UBL","RADICO",
 
     # ── NIFTY MIDCAP 150 ──────────────────────────────────────────
     "GODREJPROP","PRESTIGE","DLF","OBEROIRLTY","PHOENIXLTD","BRIGADE",
@@ -135,20 +182,21 @@ NIFTY500_SYMBOLS = [
     "ALLCARGO","VRL","TCI","BLUEDART","RBLBANK","BANDHANBNK",
     "DCBBANK","MANAPPURAM","FINEORG","VINATIORGA","POLYPLEX",
     "IIFLHFL","PGEL","NCLIND","HSCL","IOLCP","MAHSEAMLES",
-    "CAPLIPOINT","IFBAGRI","GREAVES","KTKBANK",
+    "IFBAGRI","GREAVES","KTKBANK",
 ]
 
-# Deduplicate preserving order
-NIFTY500_SYMBOLS = list(dict.fromkeys(NIFTY500_SYMBOLS))
-NIFTY500_TICKERS = [s + ".NS" for s in NIFTY500_SYMBOLS]
+# Deduplicate + build Fyers symbol list
+_RAW_SYMBOLS   = list(dict.fromkeys(_RAW_SYMBOLS))
+FYERS_SYMBOLS  = [f"NSE:{s}-EQ" for s in _RAW_SYMBOLS]
+FYERS_INDEX    = "NSE:NIFTY50-INDEX"
 
 
 # ──────────────────────────────────────────────────────────────────
 # SECTION C — LOGGING
 # ──────────────────────────────────────────────────────────────────
 def setup_logging():
-    fmt      = "%(asctime)s | %(levelname)s | %(message)s"
-    datefmt  = "%Y-%m-%d %H:%M:%S"
+    fmt     = "%(asctime)s | %(levelname)s | %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
     handlers = [
         logging.StreamHandler(),
         RotatingFileHandler(
@@ -167,8 +215,8 @@ log = logging.getLogger("KASF")
 # SECTION D — SLOT DETECTION
 # ──────────────────────────────────────────────────────────────────
 def get_current_slot():
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.now(ist)
+    ist     = pytz.timezone("Asia/Kolkata")
+    now     = datetime.now(ist)
     if now.weekday() >= 5:
         return None, None
     now_min = now.hour * 60 + now.minute
@@ -182,9 +230,8 @@ def get_current_slot():
 # SECTION E — TELEGRAM SENDER
 # ──────────────────────────────────────────────────────────────────
 def send_telegram(msg: str):
-    """Send any message directly to Telegram."""
     if not BOT_TOKEN or not CHAT_ID:
-        log.warning("BOT_TOKEN/CHAT_ID not set — skipping Telegram direct send")
+        log.warning("BOT_TOKEN/CHAT_ID not set — skipping Telegram")
         return
     try:
         url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -225,65 +272,256 @@ def send_exit_alert(slot_label: str, is_final: bool):
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION F — DATA FETCH
+# SECTION F — FYERS TOTP AUTO LOGIN
 # ──────────────────────────────────────────────────────────────────
-def _normalise(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df.columns = [c.lower() for c in df.columns]
-    return df
+def _encode_b64(value: str) -> str:
+    """Base64-encode a string — required by Fyers login endpoints."""
+    return base64.b64encode(str(value).encode("ascii")).decode("ascii")
 
 
-def fetch_batch_15m(tickers: list) -> dict:
-    try:
-        raw = yf.download(tickers, period=HISTORY_PERIOD, interval=CANDLE_INTERVAL,
-                          progress=False, auto_adjust=True, group_by="ticker")
-        result = {}
-        for t in tickers:
-            try:
-                df = raw.copy() if len(tickers) == 1 else raw[t].copy()
-                df = _normalise(df)
-                cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
-                if len(cols) < 5: continue
-                df = df[["open","high","low","close","volume"]].dropna()
-                if len(df) >= 30: result[t] = df
-            except Exception: continue
-        return result
-    except Exception as e:
-        log.warning(f"Batch 15m failed: {e}")
-        return {}
-
-
-def fetch_batch_daily(tickers: list) -> dict:
-    try:
-        raw = yf.download(tickers, period="15d", interval="1d",
-                          progress=False, auto_adjust=True, group_by="ticker")
-        result = {}
-        for t in tickers:
-            try:
-                df = raw.copy() if len(tickers) == 1 else raw[t].copy()
-                df = _normalise(df)
-                cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
-                if len(cols) < 5: continue
-                df = df[["open","high","low","close","volume"]].dropna()
-                if len(df) >= 3: result[t] = df
-            except Exception: continue
-        return result
-    except Exception as e:
-        log.warning(f"Batch daily failed: {e}")
-        return {}
-
-
-def fetch_index_sentiment() -> str:
+def _fyers_login() -> fyersModel.FyersModel | None:
     """
-    Returns BULLISH or BEARISH — INFO ONLY.
-    ✅ FIX: This no longer blocks signals. It's included in alert as context.
+    Headless TOTP auto-login for Fyers API v3.
+    Returns a ready-to-use FyersModel instance, or None on failure.
+
+    Flow:
+        1. send_login_otp  → get request_key
+        2. verify_otp      → submit TOTP code → get new request_key
+        3. verify_pin      → submit PIN → get auth_code URL
+        4. validate-authcode → get access_token
+        5. Build FyersModel
+    """
+    if not all([FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_FY_ID,
+                FYERS_PIN, FYERS_TOTP_KEY]):
+        log.error("❌ One or more FYERS_* env vars missing — cannot login")
+        return None
+
+    try:
+        # ── Step 1: send_login_otp ────────────────────────────────
+        log.info("Fyers login — Step 1: send_login_otp")
+        r1 = requests.post(
+            URL_SEND_OTP,
+            json={"fy_id": _encode_b64(FYERS_FY_ID), "app_id": "2"},
+            timeout=10
+        ).json()
+
+        if r1.get("s") == "error" or "request_key" not in r1:
+            log.error(f"send_login_otp failed: {r1}")
+            return None
+
+        request_key = r1["request_key"]
+        log.info("Step 1 OK")
+
+        # ── TOTP timing: never submit in last 3 seconds of window ─
+        if datetime.now().second % 30 > 27:
+            log.info("TOTP boundary — waiting 5s for next window")
+            time.sleep(5)
+
+        # ── Step 2: verify_otp (TOTP) ─────────────────────────────
+        log.info("Fyers login — Step 2: verify_otp (TOTP)")
+        totp_code = pyotp.TOTP(FYERS_TOTP_KEY).now()
+        r2 = requests.post(
+            URL_VERIFY_OTP,
+            json={"request_key": request_key, "otp": totp_code},
+            timeout=10
+        ).json()
+
+        if r2.get("s") == "error" or "request_key" not in r2:
+            log.error(f"verify_otp failed: {r2}")
+            return None
+
+        request_key2 = r2["request_key"]
+        log.info("Step 2 OK")
+
+        # ── Step 3: verify_pin ────────────────────────────────────
+        log.info("Fyers login — Step 3: verify_pin")
+        sess = requests.Session()
+        r3 = sess.post(
+            URL_VERIFY_PIN,
+            json={
+                "request_key":   request_key2,
+                "identity_type": "pin",
+                "identifier":    _encode_b64(FYERS_PIN)
+            },
+            timeout=10
+        ).json()
+
+        if r3.get("s") == "error" or "data" not in r3:
+            log.error(f"verify_pin failed: {r3}")
+            return None
+
+        auth_code_token = r3["data"].get("token", "")
+        if not auth_code_token:
+            log.error(f"No token in verify_pin response: {r3}")
+            return None
+
+        log.info("Step 3 OK")
+
+        # ── Step 4: get auth_code ─────────────────────────────────
+        log.info("Fyers login — Step 4: token exchange")
+        r4 = sess.post(
+            URL_TOKEN,
+            json={
+                "fyers_id":     FYERS_FY_ID,
+                "app_id":       FYERS_APP_TYPE,
+                "redirect_uri": FYERS_REDIRECT_URI,
+                "appType":      FYERS_APP_TYPE,
+                "code_challenge": "",
+                "state":        "kasf_login",
+                "scope":        "",
+                "nonce":        "",
+                "response_type": "code",
+                "create_cookie": True
+            },
+            headers={"Authorization": f"Bearer {auth_code_token}"},
+            timeout=10
+        ).json()
+
+        if r4.get("s") == "error":
+            log.error(f"token endpoint failed: {r4}")
+            return None
+
+        # auth code is embedded in the redirect URL
+        redirect_url = r4.get("Url", "")
+        parsed       = urlparse(redirect_url)
+        auth_code    = parse_qs(parsed.query).get("auth_code", [None])[0]
+
+        if not auth_code:
+            log.error(f"Could not extract auth_code from URL: {redirect_url}")
+            return None
+
+        log.info("Step 4 OK — auth_code obtained")
+
+        # ── Step 5: generate access token ─────────────────────────
+        log.info("Fyers login — Step 5: generate_token")
+        session_model = fyersModel.SessionModel(
+            client_id    = FYERS_CLIENT_ID,
+            secret_key   = FYERS_SECRET_KEY,
+            redirect_uri = FYERS_REDIRECT_URI,
+            response_type= "code",
+            grant_type   = "authorization_code"
+        )
+        session_model.set_token(auth_code)
+        token_resp   = session_model.generate_token()
+        access_token = token_resp.get("access_token", "")
+
+        if not access_token:
+            log.error(f"generate_token failed: {token_resp}")
+            return None
+
+        log.info("✅ Fyers access token generated successfully")
+
+        # ── Step 6: build FyersModel ──────────────────────────────
+        fyers = fyersModel.FyersModel(
+            client_id = FYERS_CLIENT_ID,
+            token     = access_token,
+            log_path  = ""          # suppress fyers SDK file logging
+        )
+        return fyers
+
+    except Exception as e:
+        log.error(f"Fyers login exception: {e}", exc_info=True)
+        return None
+
+
+def ensure_fyers() -> fyersModel.FyersModel | None:
+    """Return the cached FyersModel, re-login if not yet available."""
+    global _fyers_instance
+    if _fyers_instance is not None:
+        return _fyers_instance
+    log.info("No active Fyers session — attempting login...")
+    _fyers_instance = _fyers_login()
+    if _fyers_instance is None:
+        send_telegram(
+            "❌ <b>KASF — Fyers Login FAILED</b>\n"
+            "Could not generate access token.\n"
+            "Check FYERS_* env vars in Railway.\n"
+            "Scanner will NOT run until login succeeds."
+        )
+    return _fyers_instance
+
+
+# ──────────────────────────────────────────────────────────────────
+# SECTION G — DATA FETCH (Fyers API)
+# ──────────────────────────────────────────────────────────────────
+def _date_range(days_back: int):
+    """Return (from_date, to_date) strings in YYYY-MM-DD format."""
+    ist   = pytz.timezone("Asia/Kolkata")
+    today = datetime.now(ist).date()
+    start = today - timedelta(days=days_back)
+    return str(start), str(today)
+
+
+def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFrame | None:
+    """
+    Fetch OHLCV history from Fyers for one symbol.
+    Returns a DataFrame with columns [open, high, low, close, volume]
+    indexed by datetime, or None on failure.
     """
     try:
-        raw = yf.download("^NSEI", period="30d", interval="1d",
-                          progress=False, auto_adjust=True)
-        df  = _normalise(raw)
-        if df.empty or len(df) < 21: return "NEUTRAL"
+        from_date, to_date = _date_range(days)
+        data = {
+            "symbol":      symbol,
+            "resolution":  resolution,
+            "date_format": "1",          # "1" = human-readable date string
+            "range_from":  from_date,
+            "range_to":    to_date,
+            "cont_flag":   "1"
+        }
+        resp = fyers.history(data=data)
+
+        if not resp or resp.get("s") != "ok":
+            return None
+
+        candles = resp.get("candles", [])
+        if not candles:
+            return None
+
+        df = pd.DataFrame(
+            candles,
+            columns=["datetime", "open", "high", "low", "close", "volume"]
+        )
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df.set_index("datetime", inplace=True)
+        df = df[["open", "high", "low", "close", "volume"]].dropna()
+        return df if not df.empty else None
+
+    except Exception as e:
+        log.debug(f"Fyers history error {symbol}: {e}")
+        return None
+
+
+def fetch_batch_15m(symbols: list, fyers) -> dict:
+    """Fetch 15m candles for a batch. Returns {symbol: df}."""
+    result = {}
+    for sym in symbols:
+        df = _fyers_history(fyers, sym, CANDLE_INTERVAL, HISTORY_DAYS_15M)
+        if df is not None and len(df) >= 30:
+            result[sym] = df
+        time.sleep(0.12)   # ~8 req/sec — well within Fyers limits
+    return result
+
+
+def fetch_batch_daily(symbols: list, fyers) -> dict:
+    """Fetch daily candles for a batch. Returns {symbol: df}."""
+    result = {}
+    for sym in symbols:
+        df = _fyers_history(fyers, sym, DAILY_INTERVAL, HISTORY_DAYS_D)
+        if df is not None and len(df) >= 3:
+            result[sym] = df
+        time.sleep(0.12)
+    return result
+
+
+def fetch_index_sentiment(fyers) -> str:
+    """
+    Returns BULLISH or BEARISH based on NIFTY50 vs EMA20.
+    INFO ONLY — does not block signals.
+    """
+    try:
+        df = _fyers_history(fyers, FYERS_INDEX, DAILY_INTERVAL, 45)
+        if df is None or len(df) < 21:
+            return "NEUTRAL"
         c     = df["close"]
         ema20 = c.ewm(span=20, adjust=False).mean()
         sent  = "BULLISH" if float(c.iloc[-1]) > float(ema20.iloc[-1]) else "BEARISH"
@@ -295,9 +533,10 @@ def fetch_index_sentiment() -> str:
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION G — INDICATORS
+# SECTION H — INDICATORS  (unchanged from V3)
 # ──────────────────────────────────────────────────────────────────
 def calc_ema(s, p): return s.ewm(span=p, adjust=False).mean()
+
 
 def calc_rsi(close, period=14):
     d  = close.diff()
@@ -308,14 +547,16 @@ def calc_rsi(close, period=14):
     rs = ag / al.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
+
 def calc_vwap(df):
-    d          = df.copy()
-    d["date"]  = d.index.date
-    d["hlc3"]  = (d["high"] + d["low"] + d["close"]) / 3
-    d["pv"]    = d["hlc3"] * d["volume"]
-    d["cpv"]   = d.groupby("date")["pv"].cumsum()
-    d["cvol"]  = d.groupby("date")["volume"].cumsum()
+    d         = df.copy()
+    d["date"] = d.index.date
+    d["hlc3"] = (d["high"] + d["low"] + d["close"]) / 3
+    d["pv"]   = d["hlc3"] * d["volume"]
+    d["cpv"]  = d.groupby("date")["pv"].cumsum()
+    d["cvol"] = d.groupby("date")["volume"].cumsum()
     return d["cpv"] / d["cvol"]
+
 
 def calc_atr(df, period=14):
     hl  = df["high"] - df["low"]
@@ -324,34 +565,36 @@ def calc_atr(df, period=14):
     tr  = pd.concat([hl, hcp, lcp], axis=1).max(axis=1)
     return tr.ewm(com=period-1, adjust=False).mean()
 
+
 def calc_pivots(daily_df):
-    p    = daily_df.iloc[-2]
-    H, L, C = float(p["high"]), float(p["low"]), float(p["close"])
-    pvt  = (H + L + C) / 3
-    r1   = (2 * pvt) - L
-    r2   = pvt + (H - L)
-    s1   = (2 * pvt) - H
+    p        = daily_df.iloc[-2]
+    H, L, C  = float(p["high"]), float(p["low"]), float(p["close"])
+    pvt      = (H + L + C) / 3
+    r1       = (2 * pvt) - L
+    r2       = pvt + (H - L)
+    s1       = (2 * pvt) - H
     return pvt, r1, r2, s1
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION H — SIGNAL GENERATION
-# ✅ FIX: trend_ok no longer requires EMA50 in bearish market
-#    Individual stock strength decides — not index direction
+# SECTION I — SIGNAL GENERATION  (unchanged logic from V3)
+# Symbol passed here is the Fyers symbol e.g. "NSE:RELIANCE-EQ"
 # ──────────────────────────────────────────────────────────────────
-def generate_signal(symbol: str, df_15m: pd.DataFrame,
+def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
                     df_daily: pd.DataFrame, index_sentiment: str) -> dict | None:
+    # Convert "NSE:RELIANCE-EQ" → "RELIANCE" for display
+    display_symbol = fyers_symbol.replace("NSE:", "").replace("-EQ", "")
     try:
-        close  = df_15m["close"]
-        high   = df_15m["high"]
-        volume = df_15m["volume"]
+        close     = df_15m["close"]
+        high      = df_15m["high"]
+        volume    = df_15m["volume"]
 
-        ema20    = calc_ema(close, 20)
-        ema50    = calc_ema(close, 50)
-        rsi      = calc_rsi(close, 14)
-        vwap     = calc_vwap(df_15m)
-        vol_avg  = volume.rolling(20).mean()
-        high_20  = high.shift(1).rolling(20).max()
+        ema20     = calc_ema(close, 20)
+        ema50     = calc_ema(close, 50)
+        rsi       = calc_rsi(close, 14)
+        vwap      = calc_vwap(df_15m)
+        vol_avg   = volume.rolling(20).mean()
+        high_20   = high.shift(1).rolling(20).max()
         daily_atr = float(calc_atr(df_daily, 14).iloc[-1])
 
         c        = float(close.iloc[-1])
@@ -389,14 +632,13 @@ def generate_signal(symbol: str, df_15m: pd.DataFrame,
         if rr_denom <= 0: return None
         rr = (r1 - entry) / rr_denom
 
-        # ✅ FIX — BEARISH market: relax to above EMA20 + VWAP only
-        # BULLISH market: full check (above EMA20 + EMA50)
+        # BEARISH: relaxed trend check (above EMA20 + VWAP only)
         if index_sentiment == "BEARISH":
-            trend_ok = (c > e20) and (c > vwap_val)   # relaxed — EMA50 not required
+            trend_ok = (c > e20) and (c > vwap_val)
         else:
-            trend_ok = (c > e20) and (c > e50)         # full check in bullish
+            trend_ok = (c > e20) and (c > e50)
 
-        rsi_ok   = RSI_MIN < rsi_val < RSI_MAX
+        rsi_ok  = RSI_MIN < rsi_val < RSI_MAX
 
         if setup_type == "BREAKOUT":   vol_ok = v > vol_a * VOL_MULT
         elif setup_type == "PULLBACK": vol_ok = v > vol_a * 0.8
@@ -408,7 +650,7 @@ def generate_signal(symbol: str, df_15m: pd.DataFrame,
         if not valid or rr < MIN_RR: return None
 
         return {
-            "symbol":        symbol,
+            "symbol":        display_symbol,
             "market":        "INDIA",
             "entry":         round(entry, 4),
             "current_price": round(c, 4),
@@ -419,15 +661,15 @@ def generate_signal(symbol: str, df_15m: pd.DataFrame,
             "sl2":           round(sl2, 4),
             "setup":         setup_type,
             "rr":            round(rr, 2),
-            "index":         index_sentiment,   # info only in Telegram
+            "index":         index_sentiment,
         }
     except Exception as e:
-        log.debug(f"Signal error {symbol}: {e}")
+        log.debug(f"Signal error {display_symbol}: {e}")
         return None
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION I — POST TO GOOGLE SHEET
+# SECTION J — POST TO GOOGLE SHEET  (unchanged)
 # ──────────────────────────────────────────────────────────────────
 def post_to_sheet(payload: dict) -> bool:
     try:
@@ -442,14 +684,15 @@ def post_to_sheet(payload: dict) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION J — ENTRY SCAN
+# SECTION K — ENTRY SCAN
 # ──────────────────────────────────────────────────────────────────
-def run_entry_scan(slot_label: str, index_sentiment: str) -> int:
+def run_entry_scan(slot_label: str, fyers) -> int:
+    index_sentiment = fetch_index_sentiment(fyers)
+
     log.info("=" * 62)
     log.info(f"ENTRY SCAN — {slot_label} | Market: {index_sentiment}")
-    log.info(f"Stocks: {len(NIFTY500_TICKERS)} | RR≥{MIN_RR} | RSI {RSI_MIN}–{RSI_MAX}")
+    log.info(f"Stocks: {len(FYERS_SYMBOLS)} | RR≥{MIN_RR} | RSI {RSI_MIN}–{RSI_MAX}")
 
-    # Notify if bearish — but still scan
     if index_sentiment == "BEARISH":
         send_telegram(
             f"⚠️ <b>KASF — {slot_label} Scan</b>\n"
@@ -458,34 +701,33 @@ def run_entry_scan(slot_label: str, index_sentiment: str) -> int:
             f"Trade with extra caution. Tighter stops recommended."
         )
 
-    tickers = NIFTY500_TICKERS.copy()
-    random.shuffle(tickers)
+    symbols = FYERS_SYMBOLS.copy()
+    random.shuffle(symbols)
 
     signals_found = signals_posted = errors = 0
 
-    for batch_start in range(0, len(tickers), BATCH_SIZE):
+    for batch_start in range(0, len(symbols), BATCH_SIZE):
         if signals_posted >= MAX_PICKS:
             log.info(f"MAX_PICKS ({MAX_PICKS}) reached — stopping")
             break
 
-        batch      = tickers[batch_start : batch_start + BATCH_SIZE]
-        data_15m   = fetch_batch_15m(batch)
-        data_daily = fetch_batch_daily(batch)
+        batch      = symbols[batch_start : batch_start + BATCH_SIZE]
+        data_15m   = fetch_batch_15m(batch, fyers)
+        data_daily = fetch_batch_daily(batch, fyers)
 
-        for ticker in batch:
+        for sym in batch:
             if signals_posted >= MAX_PICKS: break
-            symbol   = ticker.replace(".NS", "")
-            df_15m   = data_15m.get(ticker)
-            df_daily = data_daily.get(ticker)
+            df_15m   = data_15m.get(sym)
+            df_daily = data_daily.get(sym)
             if df_15m is None or df_daily is None:
                 errors += 1
                 continue
 
-            signal = generate_signal(symbol, df_15m, df_daily, index_sentiment)
+            signal = generate_signal(sym, df_15m, df_daily, index_sentiment)
             if signal:
                 signals_found += 1
                 log.info(
-                    f"✅ {symbol:15s} | {signal['setup']:8s} "
+                    f"✅ {signal['symbol']:15s} | {signal['setup']:8s} "
                     f"| R:R={signal['rr']:4.2f} | ₹{signal['entry']}"
                 )
                 if post_to_sheet(signal):
@@ -495,11 +737,10 @@ def run_entry_scan(slot_label: str, index_sentiment: str) -> int:
                     log.warning(f"   → Sheet FAILED ✗")
 
         b = (batch_start // BATCH_SIZE) + 1
-        t = (len(tickers) + BATCH_SIZE - 1) // BATCH_SIZE
+        t = (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE
         log.info(f"Batch {b}/{t} | Signals: {signals_found} | Posted: {signals_posted}")
         time.sleep(BATCH_DELAY_SEC)
 
-    # No signals found — notify Telegram
     if signals_posted == 0:
         send_telegram(
             f"ℹ️ <b>KASF — {slot_label}</b>\n"
@@ -514,12 +755,12 @@ def run_entry_scan(slot_label: str, index_sentiment: str) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION K — MAIN
+# SECTION L — MAIN
 # ──────────────────────────────────────────────────────────────────
 def main():
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist)
-    log.info(f"KASF V5 — cron fire at {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    log.info(f"KASF V5 (Fyers) — cron fire at {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
     slot_type, slot_label = get_current_slot()
 
@@ -529,15 +770,38 @@ def main():
 
     log.info(f"Matched slot: {slot_label} → {slot_type}")
 
+    # ── TOKEN SLOT: generate and cache, then exit ─────────────────
+    if slot_type == "TOKEN":
+        log.info("TOKEN slot — generating Fyers access token now")
+        fyers = _fyers_login()
+        if fyers:
+            global _fyers_instance
+            _fyers_instance = fyers
+            log.info("✅ Token generated and cached — ready for 9:15 scan")
+            send_telegram(
+                "✅ <b>KASF — Fyers Login OK</b>\n"
+                "Access token generated at 9:00 AM.\n"
+                "Scanner is ready for today."
+            )
+        else:
+            log.error("❌ Token generation failed at 9:00 AM slot")
+            # send_telegram already called inside ensure_fyers
+        return
+
+    # ── EXIT SLOTS: no data needed ─────────────────────────────────
     if slot_type == "EXIT":
         is_final = (now.hour == 15)
         send_exit_alert(slot_label, is_final)
-        log.info("Exit alert sent — exiting (0 tokens)")
+        log.info("Exit alert sent — exiting")
         return
 
+    # ── ENTRY SLOTS: need Fyers session ───────────────────────────
     if slot_type == "ENTRY":
-        index_sentiment = fetch_index_sentiment()
-        run_entry_scan(slot_label, index_sentiment)
+        fyers = ensure_fyers()
+        if fyers is None:
+            log.error("No Fyers session available — aborting scan")
+            return
+        run_entry_scan(slot_label, fyers)
         log.info("Entry scan complete — exiting")
 
 
