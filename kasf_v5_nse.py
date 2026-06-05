@@ -649,19 +649,49 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
 
         if not valid or rr < MIN_RR: return None
 
+        # ── NEW FIELDS for Google Sheet columns N–R ───────────────
+        # price_vs_open_pct: % change from today's open to current price
+        ist_now      = datetime.now(pytz.timezone("Asia/Kolkata"))
+        today_str    = ist_now.date()
+        today_rows   = df_15m[df_15m.index.date == today_str]
+        day_open     = float(today_rows["open"].iloc[0])  if not today_rows.empty else c
+        day_high     = float(today_rows["high"].max())    if not today_rows.empty else c
+
+        price_vs_open_pct   = round(((c - day_open) / day_open * 100), 2) if day_open > 0 else 0.0
+        high_vs_current_pct = round(((c - day_high) / day_high * 100), 2) if day_high > 0 else 0.0
+
+        # signal_hour / signal_minute — current IST time
+        signal_hour   = ist_now.hour
+        signal_minute = ist_now.minute
+
+        # daily_rel_vol — today's volume vs 20-day avg daily volume
+        daily_vol_avg = float(df_daily["volume"].rolling(20).mean().iloc[-1])
+        today_vol     = float(today_rows["volume"].sum()) if not today_rows.empty else v
+        daily_rel_vol = round(today_vol / daily_vol_avg, 2) if daily_vol_avg > 0 else 1.0
+
+        # daily_rsi — RSI on daily closes
+        daily_rsi_val = round(float(calc_rsi(df_daily["close"], 14).iloc[-1]), 2)
+
         return {
-            "symbol":        display_symbol,
-            "market":        "INDIA",
-            "entry":         round(entry, 4),
-            "current_price": round(c, 4),
-            "entry_gap_pct": round(entry_gap_pct, 2),
-            "t1":            round(r1, 4),
-            "t2":            round(r2, 4),
-            "sl1":           round(sl1, 4),
-            "sl2":           round(sl2, 4),
-            "setup":         setup_type,
-            "rr":            round(rr, 2),
-            "index":         index_sentiment,
+            "symbol":               display_symbol,
+            "market":               "INDIA",
+            "entry":                round(entry, 4),
+            "current_price":        round(c, 4),
+            "entry_gap_pct":        round(entry_gap_pct, 2),
+            "t1":                   round(r1, 4),
+            "t2":                   round(r2, 4),
+            "sl1":                  round(sl1, 4),
+            "sl2":                  round(sl2, 4),
+            "setup":                setup_type,
+            "rr":                   round(rr, 2),
+            "index":                index_sentiment,
+            # ── NEW: columns N–R ──────────────────────────────────
+            "price_vs_open_pct":    price_vs_open_pct,
+            "high_vs_current_pct":  high_vs_current_pct,
+            "signal_hour":          signal_hour,
+            "signal_minute":        signal_minute,
+            "daily_rel_vol":        daily_rel_vol,
+            "daily_rsi":            daily_rsi_val,
         }
     except Exception as e:
         log.debug(f"Signal error {display_symbol}: {e}")
