@@ -57,7 +57,7 @@ from fyers_apiv3 import fyersModel
 # ──────────────────────────────────────────────────────────────────
 GOOGLE_SHEET_WEBHOOK = os.environ.get(
     "GOOGLE_SHEET_WEBHOOK",
-    "https://script.google.com/macros/s/1EqLjC0ifrvg770MSXUYvYeKj9orsCPKyR2DJtINusO8/exec"
+    "https://script.google.com/macros/s/AKfycbyVAdWehtOf76D5LqVr663sC4I-V0laqnIe60ncrzPSD9eJ5WsejUv2JQ1kRlRdEIAH2g/exec"
 )
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = os.environ.get("CHAT_ID",   "")
