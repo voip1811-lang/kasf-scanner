@@ -354,7 +354,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
             json={
                 "request_key":   request_key2,
                 "identity_type": "pin",
-                "identifier":    _sha256_pin(FYERS_PIN)   # ✅ SHA-256, NOT base64
+                "identifier":    FYERS_PIN                      # ✅ plain text PIN
             },
             timeout=10
         ).json()
