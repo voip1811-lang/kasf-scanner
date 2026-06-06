@@ -794,10 +794,13 @@ def main():
 
     slot_type, slot_label = get_current_slot()
 
-    if slot_type is None:
-        log.info(f"No active slot at {now.strftime('%H:%M IST')} — exiting (0 tokens)")
-        return
-
+   # if slot_type is None:
+    #    log.info(f"No active slot at {now.strftime('%H:%M IST')} — exiting (0 tokens)")
+     #   return
+if slot_type is None:
+    log.info(f"No active slot — forcing ENTRY for manual test")
+    slot_type  = "ENTRY"
+    slot_label = "MANUAL TEST"
     log.info(f"Matched slot: {slot_label} → {slot_type}")
 
     # ── TOKEN SLOT: generate and cache, then exit ─────────────────
