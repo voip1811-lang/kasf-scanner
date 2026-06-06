@@ -10,6 +10,7 @@
 ║   ✅ Index: ^NSEI → NSE:NIFTY50-INDEX                           ║
 ║   ✅ Telegram alert if login fails (so you know fast)           ║
 ║   ✅ TEST_MODE=true → bypasses all slot/weekend checks          ║
+║   ✅ FIX Jun-2026: verify_pin now uses SHA-256 hash (not b64)   ║
 ║                                                                  ║
 ║  RAILWAY ENV VARS REQUIRED:                                      ║
 ║   FYERS_APP_ID      → e.g. "L9NY305RTW"  (without -100)        ║
@@ -40,6 +41,7 @@
 import os
 import json
 import base64
+import hashlib
 import time
 import logging
 import random
@@ -285,9 +287,9 @@ def send_exit_alert(slot_label: str, is_final: bool):
 # ──────────────────────────────────────────────────────────────────
 # SECTION F — FYERS TOTP AUTO LOGIN
 # ──────────────────────────────────────────────────────────────────
-def _encode_b64(value: str) -> str:
-    """Base64-encode a string — required by Fyers login endpoints."""
-    return base64.b64encode(str(value).encode("ascii")).decode("ascii")
+def _sha256_pin(pin: str) -> str:
+    """SHA-256 hash the PIN — required by Fyers verify_pin endpoint."""
+    return hashlib.sha256(pin.encode("utf-8")).hexdigest()
 
 
 def _fyers_login() -> fyersModel.FyersModel | None:
@@ -298,7 +300,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
     Flow:
         1. send_login_otp  → get request_key
         2. verify_otp      → submit TOTP code → get new request_key
-        3. verify_pin      → submit PIN → get auth_code URL
+        3. verify_pin      → submit SHA-256 hashed PIN → get auth_code URL
         4. validate-authcode → get access_token
         5. Build FyersModel
     """
@@ -312,7 +314,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         log.info("Fyers login — Step 1: send_login_otp")
         r1 = requests.post(
             URL_SEND_OTP,
-            json={"fy_id": FYERS_FY_ID, "app_id": "2"},  # plain text, NOT base64
+            json={"fy_id": FYERS_FY_ID, "app_id": "2"},  # plain text fy_id
             timeout=10
         ).json()
 
@@ -344,7 +346,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         request_key2 = r2["request_key"]
         log.info("Step 2 OK")
 
-        # ── Step 3: verify_pin ────────────────────────────────────
+        # ── Step 3: verify_pin (SHA-256 hashed PIN) ───────────────
         log.info("Fyers login — Step 3: verify_pin")
         sess = requests.Session()
         r3 = sess.post(
@@ -352,7 +354,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
             json={
                 "request_key":   request_key2,
                 "identity_type": "pin",
-                "identifier":    _encode_b64(FYERS_PIN)
+                "identifier":    _sha256_pin(FYERS_PIN)   # ✅ SHA-256, NOT base64
             },
             timeout=10
         ).json()
@@ -464,11 +466,6 @@ def _date_range(days_back: int):
 
 
 def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFrame | None:
-    """
-    Fetch OHLCV history from Fyers for one symbol.
-    Returns a DataFrame with columns [open, high, low, close, volume]
-    indexed by datetime, or None on failure.
-    """
     try:
         from_date, to_date = _date_range(days)
         data = {
@@ -503,7 +500,6 @@ def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFra
 
 
 def fetch_batch_15m(symbols: list, fyers) -> dict:
-    """Fetch 15m candles for a batch. Returns {symbol: df}."""
     result = {}
     for sym in symbols:
         df = _fyers_history(fyers, sym, CANDLE_INTERVAL, HISTORY_DAYS_15M)
@@ -514,7 +510,6 @@ def fetch_batch_15m(symbols: list, fyers) -> dict:
 
 
 def fetch_batch_daily(symbols: list, fyers) -> dict:
-    """Fetch daily candles for a batch. Returns {symbol: df}."""
     result = {}
     for sym in symbols:
         df = _fyers_history(fyers, sym, DAILY_INTERVAL, HISTORY_DAYS_D)
@@ -525,10 +520,6 @@ def fetch_batch_daily(symbols: list, fyers) -> dict:
 
 
 def fetch_index_sentiment(fyers) -> str:
-    """
-    Returns BULLISH or BEARISH based on NIFTY50 vs EMA20.
-    INFO ONLY — does not block signals.
-    """
     try:
         df = _fyers_history(fyers, FYERS_INDEX, DAILY_INTERVAL, 45)
         if df is None or len(df) < 21:
@@ -657,7 +648,6 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
 
         if not valid or rr < MIN_RR: return None
 
-        # ── NEW FIELDS for Google Sheet columns N–R ───────────────
         ist_now      = datetime.now(pytz.timezone("Asia/Kolkata"))
         today_str    = ist_now.date()
         today_rows   = df_15m[df_15m.index.date == today_str]
@@ -818,7 +808,7 @@ def main():
             )
         else:
             log.error("❌ Token generation failed at 9:00 AM slot")
-        return  # TEST MODE never reaches here (always returns ENTRY)
+        return
 
     # ── EXIT SLOTS: no data needed ─────────────────────────────────
     if slot_type == "EXIT":
