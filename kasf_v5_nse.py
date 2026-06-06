@@ -10,7 +10,8 @@
 ║   ✅ Index: ^NSEI → NSE:NIFTY50-INDEX                           ║
 ║   ✅ Telegram alert if login fails (so you know fast)           ║
 ║   ✅ TEST_MODE=true → bypasses all slot/weekend checks          ║
-║   ✅ FIX Jun-2026: verify_pin now uses SHA-256 hash (not b64)   ║
+║   ✅ FIX Jun-2026: TOTP wait moved BEFORE login flow starts     ║
+║                     (request_key was expiring during mid-wait)  ║
 ║                                                                  ║
 ║  RAILWAY ENV VARS REQUIRED:                                      ║
 ║   FYERS_APP_ID      → e.g. "L9NY305RTW"  (without -100)        ║
@@ -287,22 +288,19 @@ def send_exit_alert(slot_label: str, is_final: bool):
 # ──────────────────────────────────────────────────────────────────
 # SECTION F — FYERS TOTP AUTO LOGIN
 # ──────────────────────────────────────────────────────────────────
-def _sha256_pin(pin: str) -> str:
-    """SHA-256 hash the PIN — required by Fyers verify_pin endpoint."""
-    return hashlib.sha256(pin.encode("utf-8")).hexdigest()
-
-
 def _fyers_login() -> fyersModel.FyersModel | None:
     """
     Headless TOTP auto-login for Fyers API v3.
     Returns a ready-to-use FyersModel instance, or None on failure.
 
     Flow:
-        1. send_login_otp  → get request_key
-        2. verify_otp      → submit TOTP code → get new request_key
-        3. verify_pin      → submit SHA-256 hashed PIN → get auth_code URL
-        4. validate-authcode → get access_token
-        5. Build FyersModel
+        1. TOTP boundary check — wait BEFORE starting login (not mid-flow)
+        2. send_login_otp  → get request_key
+        3. verify_otp      → submit TOTP code → get new request_key
+        4. verify_pin      → submit plain PIN → get auth_code token
+        5. token exchange  → get auth_code from redirect URL
+        6. generate_token  → get access_token
+        7. Build FyersModel
     """
     if not all([FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_FY_ID,
                 FYERS_PIN, FYERS_TOTP_KEY]):
@@ -310,11 +308,19 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         return None
 
     try:
+        # ── TOTP boundary check: wait BEFORE login starts ─────────
+        # Fyers request_key TTL is short — never pause mid-flow
+        sec = datetime.now().second % 30
+        if sec > 25:
+            wait = 31 - sec
+            log.info(f"TOTP boundary — waiting {wait}s before starting login")
+            time.sleep(wait)
+
         # ── Step 1: send_login_otp ────────────────────────────────
         log.info("Fyers login — Step 1: send_login_otp")
         r1 = requests.post(
             URL_SEND_OTP,
-            json={"fy_id": FYERS_FY_ID, "app_id": "2"},  # plain text fy_id
+            json={"fy_id": FYERS_FY_ID, "app_id": "2"},
             timeout=10
         ).json()
 
@@ -324,11 +330,6 @@ def _fyers_login() -> fyersModel.FyersModel | None:
 
         request_key = r1["request_key"]
         log.info("Step 1 OK")
-
-        # ── TOTP timing: never submit in last 3 seconds of window ─
-        if datetime.now().second % 30 > 27:
-            log.info("TOTP boundary — waiting 5s for next window")
-            time.sleep(5)
 
         # ── Step 2: verify_otp (TOTP) ─────────────────────────────
         log.info("Fyers login — Step 2: verify_otp (TOTP)")
@@ -346,7 +347,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         request_key2 = r2["request_key"]
         log.info("Step 2 OK")
 
-        # ── Step 3: verify_pin (SHA-256 hashed PIN) ───────────────
+        # ── Step 3: verify_pin (plain text PIN) ───────────────────
         log.info("Fyers login — Step 3: verify_pin")
         sess = requests.Session()
         r3 = sess.post(
@@ -354,7 +355,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
             json={
                 "request_key":   request_key2,
                 "identity_type": "pin",
-                "identifier":    FYERS_PIN                      # ✅ plain text PIN
+                "identifier":    FYERS_PIN          # plain text 4-digit PIN
             },
             timeout=10
         ).json()
@@ -375,16 +376,16 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         r4 = sess.post(
             URL_TOKEN,
             json={
-                "fyers_id":     FYERS_FY_ID,
-                "app_id":       FYERS_APP_TYPE,
-                "redirect_uri": FYERS_REDIRECT_URI,
-                "appType":      FYERS_APP_TYPE,
+                "fyers_id":       FYERS_FY_ID,
+                "app_id":         FYERS_APP_TYPE,
+                "redirect_uri":   FYERS_REDIRECT_URI,
+                "appType":        FYERS_APP_TYPE,
                 "code_challenge": "",
-                "state":        "kasf_login",
-                "scope":        "",
-                "nonce":        "",
-                "response_type": "code",
-                "create_cookie": True
+                "state":          "kasf_login",
+                "scope":          "",
+                "nonce":          "",
+                "response_type":  "code",
+                "create_cookie":  True
             },
             headers={"Authorization": f"Bearer {auth_code_token}"},
             timeout=10
@@ -394,7 +395,6 @@ def _fyers_login() -> fyersModel.FyersModel | None:
             log.error(f"token endpoint failed: {r4}")
             return None
 
-        # auth code is embedded in the redirect URL
         redirect_url = r4.get("Url", "")
         parsed       = urlparse(redirect_url)
         auth_code    = parse_qs(parsed.query).get("auth_code", [None])[0]
@@ -408,11 +408,11 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         # ── Step 5: generate access token ─────────────────────────
         log.info("Fyers login — Step 5: generate_token")
         session_model = fyersModel.SessionModel(
-            client_id    = FYERS_CLIENT_ID,
-            secret_key   = FYERS_SECRET_KEY,
-            redirect_uri = FYERS_REDIRECT_URI,
-            response_type= "code",
-            grant_type   = "authorization_code"
+            client_id     = FYERS_CLIENT_ID,
+            secret_key    = FYERS_SECRET_KEY,
+            redirect_uri  = FYERS_REDIRECT_URI,
+            response_type = "code",
+            grant_type    = "authorization_code"
         )
         session_model.set_token(auth_code)
         token_resp   = session_model.generate_token()
@@ -458,7 +458,6 @@ def ensure_fyers() -> fyersModel.FyersModel | None:
 # SECTION G — DATA FETCH (Fyers API)
 # ──────────────────────────────────────────────────────────────────
 def _date_range(days_back: int):
-    """Return (from_date, to_date) strings in YYYY-MM-DD format."""
     ist   = pytz.timezone("Asia/Kolkata")
     today = datetime.now(ist).date()
     start = today - timedelta(days=days_back)
