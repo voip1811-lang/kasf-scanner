@@ -364,63 +364,13 @@ def _fyers_login() -> fyersModel.FyersModel | None:
             log.error(f"verify_pin failed: {r3}")
             return None
 
-        auth_code_token = r3["data"].get("token", "")
-        if not auth_code_token:
-            log.error(f"No token in verify_pin response: {r3}")
-            return None
-
-        log.info("Step 3 OK")
-
-        # ── Step 4: get auth_code ─────────────────────────────────
-        log.info("Fyers login — Step 4: token exchange")
-        r4 = sess.post(
-            URL_TOKEN,
-            json={
-                "fyers_id":       FYERS_FY_ID,
-                "app_id":         FYERS_APP_TYPE,
-                "redirect_uri":   FYERS_REDIRECT_URI,
-                "appType":        FYERS_APP_TYPE,
-                "code_challenge": "",
-                "state":          "kasf_login",
-                "scope":          "",
-                "nonce":          "",
-                "response_type":  "code",
-                "create_cookie":  True
-            },
-            headers={"Authorization": f"Bearer {auth_code_token}"},
-            timeout=10
-        ).json()
-
-        if r4.get("s") == "error":
-            log.error(f"token endpoint failed: {r4}")
-            return None
-
-        redirect_url = r4.get("Url", "")
-        parsed       = urlparse(redirect_url)
-        auth_code    = parse_qs(parsed.query).get("auth_code", [None])[0]
-
-        if not auth_code:
-            log.error(f"Could not extract auth_code from URL: {redirect_url}")
-            return None
-
-        log.info("Step 4 OK — auth_code obtained")
-
-        # ── Step 5: generate access token ─────────────────────────
-        log.info("Fyers login — Step 5: generate_token")
-        session_model = fyersModel.SessionModel(
-            client_id     = FYERS_CLIENT_ID,
-            secret_key    = FYERS_SECRET_KEY,
-            redirect_uri  = FYERS_REDIRECT_URI,
-            response_type = "code",
-            grant_type    = "authorization_code"
-        )
-        session_model.set_token(auth_code)
-        token_resp   = session_model.generate_token()
-        access_token = token_resp.get("access_token", "")
-
+        # Fyers API v3 returns access_token directly in verify_pin response
+        access_token = r3["data"].get("access_token", "")
         if not access_token:
-            log.error(f"generate_token failed: {token_resp}")
+            log.error(f"No access_token in verify_pin response: {r3}")
             return None
+
+        log.info("Step 3 OK — access_token obtained directly")
 
         log.info("✅ Fyers access token generated successfully")
 
