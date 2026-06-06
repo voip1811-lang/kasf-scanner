@@ -214,17 +214,23 @@ log = logging.getLogger("KASF")
 # ──────────────────────────────────────────────────────────────────
 # SECTION D — SLOT DETECTION
 # ──────────────────────────────────────────────────────────────────
+#def get_current_slot():
+#    ist     = pytz.timezone("Asia/Kolkata")
+ #   now     = datetime.now(ist)
+  #  if now.weekday() >= 5:
+   #     return None, None
+   # now_min = now.hour * 60 + now.minute
+    #for (sh, sm, stype) in SCAN_SLOTS:
+     #   if abs(now_min - (sh * 60 + sm)) <= SLOT_TOLERANCE_MIN:
+      #      return stype, f"{sh:02d}:{sm:02d} IST"
+    #return None, None
 def get_current_slot():
     ist     = pytz.timezone("Asia/Kolkata")
     now     = datetime.now(ist)
-    if now.weekday() >= 5:
-        return None, None
+    # if now.weekday() >= 5:   # ← COMMENT THIS OUT FOR SATURDAY TEST
+    #     return None, None
     now_min = now.hour * 60 + now.minute
-    for (sh, sm, stype) in SCAN_SLOTS:
-        if abs(now_min - (sh * 60 + sm)) <= SLOT_TOLERANCE_MIN:
-            return stype, f"{sh:02d}:{sm:02d} IST"
-    return None, None
-
+    ...
 
 # ──────────────────────────────────────────────────────────────────
 # SECTION E — TELEGRAM SENDER
