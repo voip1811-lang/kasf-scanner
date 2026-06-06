@@ -9,6 +9,7 @@
 ║   ✅ Symbol format: RELIANCE → NSE:RELIANCE-EQ                  ║
 ║   ✅ Index: ^NSEI → NSE:NIFTY50-INDEX                           ║
 ║   ✅ Telegram alert if login fails (so you know fast)           ║
+║   ✅ TEST_MODE=true → bypasses all slot/weekend checks          ║
 ║                                                                  ║
 ║  RAILWAY ENV VARS REQUIRED:                                      ║
 ║   FYERS_APP_ID      → e.g. "L9NY305RTW"  (without -100)        ║
@@ -20,6 +21,10 @@
 ║   BOT_TOKEN         → Telegram bot token                        ║
 ║   CHAT_ID           → Telegram chat ID                          ║
 ║   GOOGLE_SHEET_WEBHOOK → Google Apps Script URL                 ║
+║                                                                  ║
+║  OPTIONAL ENV VAR:                                               ║
+║   TEST_MODE=true    → run anytime, any day, skips slot check    ║
+║   TEST_MODE=false   → normal production schedule                ║
 ║                                                                  ║
 ║  SCHEDULE (6 slots — hardcoded):                                ║
 ║   9:00 AM → TOKEN GEN (runs first, before market)              ║
@@ -57,18 +62,18 @@ from fyers_apiv3 import fyersModel
 # ──────────────────────────────────────────────────────────────────
 GOOGLE_SHEET_WEBHOOK = os.environ.get(
     "GOOGLE_SHEET_WEBHOOK",
-    "https://script.google.com/macros/s/AKfycbyVAdWehtOf76D5LqVr663sC4I-V0laqnIe60ncrzPSD9eJ5WsejUv2JQ1kRlRdEIAH2g/exec"
+    "https://script.google.com/macros/s/1EqLjC0ifrvg770MSXUYvYeKj9orsCPKyR2DJtINusO8/exec"
 )
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = os.environ.get("CHAT_ID",   "")
 
 # ── FYERS CREDENTIALS (from Railway env vars) ─────────────────────
-FYERS_APP_ID       = os.environ.get("FYERS_APP_ID",       "")   # e.g. "L9NY305RTW"
-FYERS_APP_TYPE     = "100"                                        # always 100 for web
+FYERS_APP_ID       = os.environ.get("FYERS_APP_ID",       "")
+FYERS_APP_TYPE     = "100"
 FYERS_SECRET_KEY   = os.environ.get("FYERS_SECRET_KEY",   "")
-FYERS_FY_ID        = os.environ.get("FYERS_FY_ID",        "")   # Fyers client ID / login
-FYERS_PIN          = os.environ.get("FYERS_PIN",          "")   # 4-digit PIN as string
-FYERS_TOTP_KEY     = os.environ.get("FYERS_TOTP_KEY",     "")   # 32-char TOTP secret
+FYERS_FY_ID        = os.environ.get("FYERS_FY_ID",        "")
+FYERS_PIN          = os.environ.get("FYERS_PIN",          "")
+FYERS_TOTP_KEY     = os.environ.get("FYERS_TOTP_KEY",     "")
 FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI", "https://trade.fyers.in/api-login/redirect-uri/index.html")
 
 # Fyers client_id format is "APPID-100"
@@ -93,16 +98,16 @@ PULL_PCT  = 0.003
 MAX_PICKS = 3
 
 # ── SCANNER SETTINGS ──────────────────────────────────────────────
-CANDLE_INTERVAL  = "15"     # Fyers: "15" = 15-minute candles
-DAILY_INTERVAL   = "D"      # Fyers: "D"  = daily candles
-HISTORY_DAYS_15M = 5        # days of 15m history
-HISTORY_DAYS_D   = 15       # days of daily history
+CANDLE_INTERVAL  = "15"
+DAILY_INTERVAL   = "D"
+HISTORY_DAYS_15M = 5
+HISTORY_DAYS_D   = 15
 BATCH_SIZE       = 10
 BATCH_DELAY_SEC  = 1.5
 
 # ── TIME SLOTS ────────────────────────────────────────────────────
 SCAN_SLOTS = [
-    (9,   0, "TOKEN"),    # token generation — must run before any scan
+    (9,   0, "TOKEN"),
     (9,  15, "ENTRY"),
     (9,  30, "ENTRY"),
     (10,  0, "ENTRY"),
@@ -113,7 +118,7 @@ SCAN_SLOTS = [
 SLOT_TOLERANCE_MIN = 7
 
 # ── TOKEN CACHE (in-memory for the day) ───────────────────────────
-_fyers_instance = None   # fyersModel.FyersModel — set after login
+_fyers_instance = None
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -214,23 +219,23 @@ log = logging.getLogger("KASF")
 # ──────────────────────────────────────────────────────────────────
 # SECTION D — SLOT DETECTION
 # ──────────────────────────────────────────────────────────────────
-#def get_current_slot():
-#    ist     = pytz.timezone("Asia/Kolkata")
- #   now     = datetime.now(ist)
-  #  if now.weekday() >= 5:
-   #     return None, None
-   # now_min = now.hour * 60 + now.minute
-    #for (sh, sm, stype) in SCAN_SLOTS:
-     #   if abs(now_min - (sh * 60 + sm)) <= SLOT_TOLERANCE_MIN:
-      #      return stype, f"{sh:02d}:{sm:02d} IST"
-    #return None, None
 def get_current_slot():
-    ist     = pytz.timezone("Asia/Kolkata")
-    now     = datetime.now(ist)
-    # if now.weekday() >= 5:   # ← COMMENT THIS OUT FOR SATURDAY TEST
-    #     return None, None
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+
+    # ── TEST MODE: bypass all slot and weekend checks ─────────────
+    if os.environ.get("TEST_MODE", "").lower() == "true":
+        log.info("⚠️ TEST MODE ON — skipping slot/weekend check")
+        return "ENTRY", f"{now.hour:02d}:{now.minute:02d} IST (TEST)"
+
+    if now.weekday() >= 5:
+        return None, None
     now_min = now.hour * 60 + now.minute
-    ...
+    for (sh, sm, stype) in SCAN_SLOTS:
+        if abs(now_min - (sh * 60 + sm)) <= SLOT_TOLERANCE_MIN:
+            return stype, f"{sh:02d}:{sm:02d} IST"
+    return None, None
+
 
 # ──────────────────────────────────────────────────────────────────
 # SECTION E — TELEGRAM SENDER
@@ -421,7 +426,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         fyers = fyersModel.FyersModel(
             client_id = FYERS_CLIENT_ID,
             token     = access_token,
-            log_path  = ""          # suppress fyers SDK file logging
+            log_path  = ""
         )
         return fyers
 
@@ -469,7 +474,7 @@ def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFra
         data = {
             "symbol":      symbol,
             "resolution":  resolution,
-            "date_format": "1",          # "1" = human-readable date string
+            "date_format": "1",
             "range_from":  from_date,
             "range_to":    to_date,
             "cont_flag":   "1"
@@ -504,7 +509,7 @@ def fetch_batch_15m(symbols: list, fyers) -> dict:
         df = _fyers_history(fyers, sym, CANDLE_INTERVAL, HISTORY_DAYS_15M)
         if df is not None and len(df) >= 30:
             result[sym] = df
-        time.sleep(0.12)   # ~8 req/sec — well within Fyers limits
+        time.sleep(0.12)
     return result
 
 
@@ -539,7 +544,7 @@ def fetch_index_sentiment(fyers) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION H — INDICATORS  (unchanged from V3)
+# SECTION H — INDICATORS
 # ──────────────────────────────────────────────────────────────────
 def calc_ema(s, p): return s.ewm(span=p, adjust=False).mean()
 
@@ -583,12 +588,10 @@ def calc_pivots(daily_df):
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION I — SIGNAL GENERATION  (unchanged logic from V3)
-# Symbol passed here is the Fyers symbol e.g. "NSE:RELIANCE-EQ"
+# SECTION I — SIGNAL GENERATION
 # ──────────────────────────────────────────────────────────────────
 def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
                     df_daily: pd.DataFrame, index_sentiment: str) -> dict | None:
-    # Convert "NSE:RELIANCE-EQ" → "RELIANCE" for display
     display_symbol = fyers_symbol.replace("NSE:", "").replace("-EQ", "")
     try:
         close     = df_15m["close"]
@@ -638,7 +641,6 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
         if rr_denom <= 0: return None
         rr = (r1 - entry) / rr_denom
 
-        # BEARISH: relaxed trend check (above EMA20 + VWAP only)
         if index_sentiment == "BEARISH":
             trend_ok = (c > e20) and (c > vwap_val)
         else:
@@ -656,7 +658,6 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
         if not valid or rr < MIN_RR: return None
 
         # ── NEW FIELDS for Google Sheet columns N–R ───────────────
-        # price_vs_open_pct: % change from today's open to current price
         ist_now      = datetime.now(pytz.timezone("Asia/Kolkata"))
         today_str    = ist_now.date()
         today_rows   = df_15m[df_15m.index.date == today_str]
@@ -666,16 +667,13 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
         price_vs_open_pct   = round(((c - day_open) / day_open * 100), 2) if day_open > 0 else 0.0
         high_vs_current_pct = round(((c - day_high) / day_high * 100), 2) if day_high > 0 else 0.0
 
-        # signal_hour / signal_minute — current IST time
         signal_hour   = ist_now.hour
         signal_minute = ist_now.minute
 
-        # daily_rel_vol — today's volume vs 20-day avg daily volume
         daily_vol_avg = float(df_daily["volume"].rolling(20).mean().iloc[-1])
         today_vol     = float(today_rows["volume"].sum()) if not today_rows.empty else v
         daily_rel_vol = round(today_vol / daily_vol_avg, 2) if daily_vol_avg > 0 else 1.0
 
-        # daily_rsi — RSI on daily closes
         daily_rsi_val = round(float(calc_rsi(df_daily["close"], 14).iloc[-1]), 2)
 
         return {
@@ -691,7 +689,6 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
             "setup":                setup_type,
             "rr":                   round(rr, 2),
             "index":                index_sentiment,
-            # ── NEW: columns N–R ──────────────────────────────────
             "price_vs_open_pct":    price_vs_open_pct,
             "high_vs_current_pct":  high_vs_current_pct,
             "signal_hour":          signal_hour,
@@ -705,7 +702,7 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION J — POST TO GOOGLE SHEET  (unchanged)
+# SECTION J — POST TO GOOGLE SHEET
 # ──────────────────────────────────────────────────────────────────
 def post_to_sheet(payload: dict) -> bool:
     try:
@@ -800,13 +797,10 @@ def main():
 
     slot_type, slot_label = get_current_slot()
 
-   # if slot_type is None:
-    #    log.info(f"No active slot at {now.strftime('%H:%M IST')} — exiting (0 tokens)")
-     #   return
-if slot_type is None:
-    log.info(f"No active slot — forcing ENTRY for manual test")
-    slot_type  = "ENTRY"
-    slot_label = "MANUAL TEST"
+    if slot_type is None:
+        log.info(f"No active slot at {now.strftime('%H:%M IST')} — exiting (0 tokens)")
+        return
+
     log.info(f"Matched slot: {slot_label} → {slot_type}")
 
     # ── TOKEN SLOT: generate and cache, then exit ─────────────────
@@ -824,8 +818,7 @@ if slot_type is None:
             )
         else:
             log.error("❌ Token generation failed at 9:00 AM slot")
-            # send_telegram already called inside ensure_fyers
-        return
+        return  # TEST MODE never reaches here (always returns ENTRY)
 
     # ── EXIT SLOTS: no data needed ─────────────────────────────────
     if slot_type == "EXIT":
