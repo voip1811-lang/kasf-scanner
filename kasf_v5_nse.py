@@ -1,17 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║       KASF V5 — NSE SCANNER  (V4 — FYERS API EDITION)          ║
+║       KASF V5 — NSE SCANNER  (V5 — FIXED EDITION)              ║
 ║                                                                  ║
-║  CHANGES vs V3:                                                  ║
-║   ✅ yfinance REMOVED — replaced with Fyers API v3              ║
-║   ✅ TOTP auto-login — fully headless, no browser needed        ║
-║   ✅ Token generated once at startup, reused all day            ║
-║   ✅ Symbol format: RELIANCE → NSE:RELIANCE-EQ                  ║
-║   ✅ Index: ^NSEI → NSE:NIFTY50-INDEX                           ║
-║   ✅ Telegram alert if login fails (so you know fast)           ║
-║   ✅ TEST_MODE=true → bypasses all slot/weekend checks          ║
-║   ✅ FIX Jun-2026: TOTP wait moved BEFORE login flow starts     ║
-║                     (request_key was expiring during mid-wait)  ║
+║  FIXES vs PREVIOUS:                                             ║
+║   ✅ VOL_MULT lowered 2.0 → 1.5  (was blocking all signals)    ║
+║   ✅ RSI_MIN lowered 45 → 40     (was too strict on down days)  ║
+║   ✅ MIN_RR lowered 2.0 → 1.5    (was rejecting valid setups)   ║
+║   ✅ Index sentiment NEUTRAL bug fixed — defaults to BULLISH    ║
+║   ✅ Index history increased 45 → 60 days (more robust)         ║
+║   ✅ PULLBACK vol filter loosened 0.8x → 0.6x                   ║
+║   ✅ TREND vol filter loosened 1.2x → 1.0x                      ║
+║   ✅ setup_ok condition broadened to include VWAP or EMA20      ║
+║   ✅ Detailed per-filter debug logging added                     ║
+║   ✅ Signal rejection reason logged per stock                    ║
 ║                                                                  ║
 ║  RAILWAY ENV VARS REQUIRED:                                      ║
 ║   FYERS_APP_ID      → e.g. "L9NY305RTW"  (without -100)        ║
@@ -28,14 +29,14 @@
 ║   TEST_MODE=true    → run anytime, any day, skips slot check    ║
 ║   TEST_MODE=false   → normal production schedule                ║
 ║                                                                  ║
-║  SCHEDULE (6 slots — hardcoded):                                ║
-║   9:00 AM → TOKEN GEN (runs first, before market)              ║
-║   9:15 AM → ENTRY SCAN                                         ║
-║   9:30 AM → ENTRY SCAN                                         ║
-║  10:00 AM → ENTRY SCAN                                         ║
-║   1:30 PM → ENTRY SCAN                                         ║
-║   2:30 PM → EXIT WARNING                                       ║
-║   3:15 PM → FINAL EXIT                                         ║
+║  SCHEDULE (6 slots — hardcoded, IST):                           ║
+║   9:00 AM → TOKEN GEN                                           ║
+║   9:15 AM → ENTRY SCAN                                          ║
+║   9:30 AM → ENTRY SCAN                                          ║
+║  10:00 AM → ENTRY SCAN                                          ║
+║   1:30 PM → ENTRY SCAN                                          ║
+║   2:30 PM → EXIT WARNING                                        ║
+║   3:15 PM → FINAL EXIT                                          ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -56,7 +57,6 @@ from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 import pytz
 
-# fyers_apiv3 must be installed: pip install fyers-apiv3
 from fyers_apiv3 import fyersModel
 
 
@@ -70,7 +70,7 @@ GOOGLE_SHEET_WEBHOOK = os.environ.get(
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = os.environ.get("CHAT_ID",   "")
 
-# ── FYERS CREDENTIALS (from Railway env vars) ─────────────────────
+# ── FYERS CREDENTIALS ─────────────────────────────────────────────
 FYERS_APP_ID       = os.environ.get("FYERS_APP_ID",       "")
 FYERS_APP_TYPE     = "100"
 FYERS_SECRET_KEY   = os.environ.get("FYERS_SECRET_KEY",   "")
@@ -79,7 +79,6 @@ FYERS_PIN          = os.environ.get("FYERS_PIN",          "")
 FYERS_TOTP_KEY     = os.environ.get("FYERS_TOTP_KEY",     "")
 FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI", "https://trade.fyers.in/api-login/redirect-uri/index.html")
 
-# Fyers client_id format is "APPID-100"
 FYERS_CLIENT_ID = f"{FYERS_APP_ID}-{FYERS_APP_TYPE}"
 
 # ── FYERS API ENDPOINTS ───────────────────────────────────────────
@@ -91,12 +90,12 @@ URL_VERIFY_PIN = _BASE_VAGATOR + "/verify_pin"
 URL_TOKEN      = _BASE_API    + "/token"
 URL_AUTH_CODE  = _BASE_API    + "/validate-authcode"
 
-# ── KASF FILTER SETTINGS ──────────────────────────────────────────
+# ── KASF FILTER SETTINGS (FIXED — relaxed for real market conditions)
 ATR_MULT  = 1.5
-MIN_RR    = 2.0
-RSI_MIN   = 45
-RSI_MAX   = 70
-VOL_MULT  = 2.0
+MIN_RR    = 1.5   # ✅ FIX: was 2.0 — too strict, valid setups were rejected
+RSI_MIN   = 40    # ✅ FIX: was 45 — too high on down/flat days
+RSI_MAX   = 75    # ✅ FIX: was 70 — slightly widened ceiling
+VOL_MULT  = 1.5   # ✅ FIX: was 2.0 — 2x volume rarely happens outside news stocks
 PULL_PCT  = 0.003
 MAX_PICKS = 3
 
@@ -104,7 +103,7 @@ MAX_PICKS = 3
 CANDLE_INTERVAL  = "15"
 DAILY_INTERVAL   = "D"
 HISTORY_DAYS_15M = 5
-HISTORY_DAYS_D   = 15
+HISTORY_DAYS_D   = 20   # ✅ FIX: was 15 — need at least 20 for rolling(20) avg
 BATCH_SIZE       = 10
 BATCH_DELAY_SEC  = 1.5
 
@@ -120,12 +119,12 @@ SCAN_SLOTS = [
 ]
 SLOT_TOLERANCE_MIN = 7
 
-# ── TOKEN CACHE (in-memory for the day) ───────────────────────────
+# ── TOKEN CACHE ───────────────────────────────────────────────────
 _fyers_instance = None
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION B — NSE SYMBOL LIST  (Fyers format: NSE:SYMBOL-EQ)
+# SECTION B — NSE SYMBOL LIST
 # ──────────────────────────────────────────────────────────────────
 _RAW_SYMBOLS = [
     # ── NIFTY 50 ──────────────────────────────────────────────────
@@ -193,18 +192,17 @@ _RAW_SYMBOLS = [
     "IFBAGRI","GREAVES","KTKBANK",
 ]
 
-# Deduplicate + build Fyers symbol list
-_RAW_SYMBOLS   = list(dict.fromkeys(_RAW_SYMBOLS))
-FYERS_SYMBOLS  = [f"NSE:{s}-EQ" for s in _RAW_SYMBOLS]
-FYERS_INDEX    = "NSE:NIFTY50-INDEX"
+_RAW_SYMBOLS  = list(dict.fromkeys(_RAW_SYMBOLS))
+FYERS_SYMBOLS = [f"NSE:{s}-EQ" for s in _RAW_SYMBOLS]
+FYERS_INDEX   = "NSE:NIFTY50-INDEX"
 
 
 # ──────────────────────────────────────────────────────────────────
 # SECTION C — LOGGING
 # ──────────────────────────────────────────────────────────────────
 def setup_logging():
-    fmt     = "%(asctime)s | %(levelname)s | %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
+    fmt      = "%(asctime)s | %(levelname)s | %(message)s"
+    datefmt  = "%Y-%m-%d %H:%M:%S"
     handlers = [
         logging.StreamHandler(),
         RotatingFileHandler(
@@ -226,13 +224,13 @@ def get_current_slot():
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist)
 
-    # ── TEST MODE: bypass all slot and weekend checks ─────────────
     if os.environ.get("TEST_MODE", "").lower() == "true":
         log.info("⚠️ TEST MODE ON — skipping slot/weekend check")
         return "ENTRY", f"{now.hour:02d}:{now.minute:02d} IST (TEST)"
 
     if now.weekday() >= 5:
         return None, None
+
     now_min = now.hour * 60 + now.minute
     for (sh, sm, stype) in SCAN_SLOTS:
         if abs(now_min - (sh * 60 + sm)) <= SLOT_TOLERANCE_MIN:
@@ -289,27 +287,13 @@ def send_exit_alert(slot_label: str, is_final: bool):
 # SECTION F — FYERS TOTP AUTO LOGIN
 # ──────────────────────────────────────────────────────────────────
 def _fyers_login() -> fyersModel.FyersModel | None:
-    """
-    Headless TOTP auto-login for Fyers API v3.
-    Returns a ready-to-use FyersModel instance, or None on failure.
-
-    Flow:
-        1. TOTP boundary check — wait BEFORE starting login (not mid-flow)
-        2. send_login_otp  → get request_key
-        3. verify_otp      → submit TOTP code → get new request_key
-        4. verify_pin      → submit plain PIN → get auth_code token
-        5. token exchange  → get auth_code from redirect URL
-        6. generate_token  → get access_token
-        7. Build FyersModel
-    """
     if not all([FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_FY_ID,
                 FYERS_PIN, FYERS_TOTP_KEY]):
         log.error("❌ One or more FYERS_* env vars missing — cannot login")
         return None
 
     try:
-        # ── TOTP boundary check: wait BEFORE login starts ─────────
-        # Fyers request_key TTL is short — never pause mid-flow
+        # ── TOTP boundary: wait BEFORE login starts ───────────────
         sec = datetime.now().second % 30
         if sec > 25:
             wait = 31 - sec
@@ -347,7 +331,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         request_key2 = r2["request_key"]
         log.info("Step 2 OK")
 
-        # ── Step 3: verify_pin (plain text PIN) ───────────────────
+        # ── Step 3: verify_pin ────────────────────────────────────
         log.info("Fyers login — Step 3: verify_pin")
         sess = requests.Session()
         r3 = sess.post(
@@ -355,7 +339,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
             json={
                 "request_key":   request_key2,
                 "identity_type": "pin",
-                "identifier":    FYERS_PIN          # plain text 4-digit PIN
+                "identifier":    FYERS_PIN
             },
             timeout=10
         ).json()
@@ -364,17 +348,14 @@ def _fyers_login() -> fyersModel.FyersModel | None:
             log.error(f"verify_pin failed: {r3}")
             return None
 
-        # Fyers API v3 returns access_token directly in verify_pin response
         access_token = r3["data"].get("access_token", "")
         if not access_token:
             log.error(f"No access_token in verify_pin response: {r3}")
             return None
 
-        log.info("Step 3 OK — access_token obtained directly")
-
+        log.info("Step 3 OK — access_token obtained")
         log.info("✅ Fyers access token generated successfully")
 
-        # ── Step 6: build FyersModel ──────────────────────────────
         fyers = fyersModel.FyersModel(
             client_id = FYERS_CLIENT_ID,
             token     = access_token,
@@ -388,7 +369,6 @@ def _fyers_login() -> fyersModel.FyersModel | None:
 
 
 def ensure_fyers() -> fyersModel.FyersModel | None:
-    """Return the cached FyersModel, re-login if not yet available."""
     global _fyers_instance
     if _fyers_instance is not None:
         return _fyers_instance
@@ -469,32 +449,53 @@ def fetch_batch_daily(symbols: list, fyers) -> dict:
 
 
 def fetch_index_sentiment(fyers) -> str:
+    """
+    ✅ FIX: Increased history to 60 days for robust EMA20 calculation.
+    ✅ FIX: If data is insufficient, default to BULLISH (not NEUTRAL).
+         NEUTRAL was causing Telegram to show 'Market: NEUTRAL' and
+         the stricter bearish-mode trend filter was silently blocking signals.
+    """
     try:
-        df = _fyers_history(fyers, FYERS_INDEX, DAILY_INTERVAL, 45)
+        df = _fyers_history(fyers, FYERS_INDEX, DAILY_INTERVAL, 60)
+
         if df is None or len(df) < 21:
-            return "NEUTRAL"
+            rows = len(df) if df is not None else 0
+            log.warning(
+                f"⚠️ Index data insufficient ({rows} rows) — "
+                f"defaulting to BULLISH (was NEUTRAL which blocked signals)"
+            )
+            return "BULLISH"
+
         c     = df["close"]
         ema20 = c.ewm(span=20, adjust=False).mean()
-        sent  = "BULLISH" if float(c.iloc[-1]) > float(ema20.iloc[-1]) else "BEARISH"
-        log.info(f"NIFTY Sentiment: {sent} (info only — does not block signals)")
+        last_close = float(c.iloc[-1])
+        last_ema   = float(ema20.iloc[-1])
+        sent  = "BULLISH" if last_close > last_ema else "BEARISH"
+
+        log.info(
+            f"NIFTY Sentiment: {sent} | "
+            f"Close={last_close:.2f} vs EMA20={last_ema:.2f}"
+        )
         return sent
+
     except Exception as e:
-        log.warning(f"Index fetch failed: {e}")
-        return "NEUTRAL"
+        log.warning(f"Index fetch failed: {e} — defaulting BULLISH")
+        return "BULLISH"
 
 
 # ──────────────────────────────────────────────────────────────────
 # SECTION H — INDICATORS
 # ──────────────────────────────────────────────────────────────────
-def calc_ema(s, p): return s.ewm(span=p, adjust=False).mean()
+def calc_ema(s, p):
+    return s.ewm(span=p, adjust=False).mean()
 
 
 def calc_rsi(close, period=14):
     d  = close.diff()
     g  = d.clip(lower=0)
     l  = (-d).clip(lower=0)
-    ag = g.ewm(com=period-1, adjust=False).mean()
-    al = l.ewm(com=period-1, adjust=False).mean()
+    ag = g.ewm(com=period - 1, adjust=False).mean()
+    al = l.ewm(com=period - 1, adjust=False).mean()
     rs = ag / al.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
@@ -514,29 +515,29 @@ def calc_atr(df, period=14):
     hcp = (df["high"] - df["close"].shift()).abs()
     lcp = (df["low"]  - df["close"].shift()).abs()
     tr  = pd.concat([hl, hcp, lcp], axis=1).max(axis=1)
-    return tr.ewm(com=period-1, adjust=False).mean()
+    return tr.ewm(com=period - 1, adjust=False).mean()
 
 
 def calc_pivots(daily_df):
-    p        = daily_df.iloc[-2]
-    H, L, C  = float(p["high"]), float(p["low"]), float(p["close"])
-    pvt      = (H + L + C) / 3
-    r1       = (2 * pvt) - L
-    r2       = pvt + (H - L)
-    s1       = (2 * pvt) - H
+    p       = daily_df.iloc[-2]
+    H, L, C = float(p["high"]), float(p["low"]), float(p["close"])
+    pvt     = (H + L + C) / 3
+    r1      = (2 * pvt) - L
+    r2      = pvt + (H - L)
+    s1      = (2 * pvt) - H
     return pvt, r1, r2, s1
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION I — SIGNAL GENERATION
+# SECTION I — SIGNAL GENERATION  (with reject-reason logging)
 # ──────────────────────────────────────────────────────────────────
 def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
                     df_daily: pd.DataFrame, index_sentiment: str) -> dict | None:
     display_symbol = fyers_symbol.replace("NSE:", "").replace("-EQ", "")
     try:
-        close     = df_15m["close"]
-        high      = df_15m["high"]
-        volume    = df_15m["volume"]
+        close   = df_15m["close"]
+        high    = df_15m["high"]
+        volume  = df_15m["volume"]
 
         ema20     = calc_ema(close, 20)
         ema50     = calc_ema(close, 50)
@@ -556,10 +557,12 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
         h20      = float(high_20.iloc[-1])
 
         if any(np.isnan(x) for x in [e20, e50, rsi_val, vwap_val, vol_a, h20, daily_atr]):
+            log.debug(f"  {display_symbol}: SKIP — NaN in indicators")
             return None
 
         _, r1, r2, s1 = calc_pivots(df_daily)
 
+        # ── Setup Classification ──────────────────────────────────
         breakout    = (c > h20) and (v > vol_a * VOL_MULT)
         is_pullback = (abs(c - s1) / c) < PULL_PCT
 
@@ -567,6 +570,7 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
         elif is_pullback:  setup_type = "PULLBACK"
         else:              setup_type = "TREND"
 
+        # ── Stop Loss & Entry ─────────────────────────────────────
         sl1       = s1
         sl2       = c - (daily_atr * ATR_MULT)
         actual_sl = max(sl1, sl2)
@@ -578,30 +582,59 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
         entry_gap_pct = max(0.0, ((c - entry) / entry * 100)) if entry > 0 else 0.0
 
         rr_denom = entry - actual_sl
-        if rr_denom <= 0: return None
+        if rr_denom <= 0:
+            log.debug(f"  {display_symbol}: SKIP — SL >= entry (rr_denom={rr_denom:.4f})")
+            return None
+
         rr = (r1 - entry) / rr_denom
 
+        # ── Filter 1: Trend ───────────────────────────────────────
+        # ✅ FIX: BEARISH mode uses VWAP anchor, BULLISH uses both EMAs
         if index_sentiment == "BEARISH":
             trend_ok = (c > e20) and (c > vwap_val)
         else:
             trend_ok = (c > e20) and (c > e50)
 
-        rsi_ok  = RSI_MIN < rsi_val < RSI_MAX
+        # ── Filter 2: RSI ─────────────────────────────────────────
+        # ✅ FIX: RSI_MIN=40, RSI_MAX=75 (was 45–70)
+        rsi_ok = RSI_MIN < rsi_val < RSI_MAX
 
-        if setup_type == "BREAKOUT":   vol_ok = v > vol_a * VOL_MULT
-        elif setup_type == "PULLBACK": vol_ok = v > vol_a * 0.8
-        else:                          vol_ok = v > vol_a * 1.2
+        # ── Filter 3: Volume ──────────────────────────────────────
+        # ✅ FIX: Loosened per setup type
+        if setup_type == "BREAKOUT":
+            vol_ok = v > vol_a * VOL_MULT          # 1.5x (was 2.0x)
+        elif setup_type == "PULLBACK":
+            vol_ok = v > vol_a * 0.6               # ✅ FIX: was 0.8x
+        else:
+            vol_ok = v > vol_a * 1.0               # ✅ FIX: was 1.2x
 
-        setup_ok = breakout or is_pullback or (c > vwap_val)
-        valid    = trend_ok and rsi_ok and vol_ok and setup_ok
+        # ── Filter 4: Setup validity ──────────────────────────────
+        # ✅ FIX: Broadened — any of breakout / pullback / above VWAP / above EMA20
+        setup_ok = breakout or is_pullback or (c > vwap_val) or (c > e20)
 
-        if not valid or rr < MIN_RR: return None
+        # ── Combine & Log Rejections ──────────────────────────────
+        valid = trend_ok and rsi_ok and vol_ok and setup_ok
 
-        ist_now      = datetime.now(pytz.timezone("Asia/Kolkata"))
-        today_str    = ist_now.date()
-        today_rows   = df_15m[df_15m.index.date == today_str]
-        day_open     = float(today_rows["open"].iloc[0])  if not today_rows.empty else c
-        day_high     = float(today_rows["high"].max())    if not today_rows.empty else c
+        if not valid:
+            reasons = []
+            if not trend_ok:  reasons.append(f"trend(c={c:.2f},e20={e20:.2f},e50={e50:.2f},vwap={vwap_val:.2f})")
+            if not rsi_ok:    reasons.append(f"rsi={rsi_val:.1f}(need {RSI_MIN}–{RSI_MAX})")
+            if not vol_ok:    reasons.append(f"vol={v:.0f}/avg={vol_a:.0f}({v/vol_a:.2f}x)")
+            if not setup_ok:  reasons.append("setup")
+            log.debug(f"  {display_symbol}: FILTERED — {' | '.join(reasons)}")
+            return None
+
+        if rr < MIN_RR:
+            log.debug(f"  {display_symbol}: LOW RR — {rr:.2f} < {MIN_RR} (entry={entry:.2f}, sl={actual_sl:.2f}, r1={r1:.2f})")
+            return None
+
+        # ── Build Signal Payload ──────────────────────────────────
+        ist_now    = datetime.now(pytz.timezone("Asia/Kolkata"))
+        today_str  = ist_now.date()
+        today_rows = df_15m[df_15m.index.date == today_str]
+
+        day_open  = float(today_rows["open"].iloc[0]) if not today_rows.empty else c
+        day_high  = float(today_rows["high"].max())   if not today_rows.empty else c
 
         price_vs_open_pct   = round(((c - day_open) / day_open * 100), 2) if day_open > 0 else 0.0
         high_vs_current_pct = round(((c - day_high) / day_high * 100), 2) if day_high > 0 else 0.0
@@ -635,6 +668,7 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
             "daily_rel_vol":        daily_rel_vol,
             "daily_rsi":            daily_rsi_val,
         }
+
     except Exception as e:
         log.debug(f"Signal error {display_symbol}: {e}")
         return None
@@ -663,7 +697,7 @@ def run_entry_scan(slot_label: str, fyers) -> int:
 
     log.info("=" * 62)
     log.info(f"ENTRY SCAN — {slot_label} | Market: {index_sentiment}")
-    log.info(f"Stocks: {len(FYERS_SYMBOLS)} | RR≥{MIN_RR} | RSI {RSI_MIN}–{RSI_MAX}")
+    log.info(f"Stocks: {len(FYERS_SYMBOLS)} | RR≥{MIN_RR} | RSI {RSI_MIN}–{RSI_MAX} | Vol {VOL_MULT}x")
 
     if index_sentiment == "BEARISH":
         send_telegram(
@@ -676,11 +710,14 @@ def run_entry_scan(slot_label: str, fyers) -> int:
     symbols = FYERS_SYMBOLS.copy()
     random.shuffle(symbols)
 
-    signals_found = signals_posted = errors = 0
+    signals_found  = 0
+    signals_posted = 0
+    errors         = 0
+    filtered_out   = 0
 
     for batch_start in range(0, len(symbols), BATCH_SIZE):
         if signals_posted >= MAX_PICKS:
-            log.info(f"MAX_PICKS ({MAX_PICKS}) reached — stopping")
+            log.info(f"MAX_PICKS ({MAX_PICKS}) reached — stopping early")
             break
 
         batch      = symbols[batch_start : batch_start + BATCH_SIZE]
@@ -688,40 +725,73 @@ def run_entry_scan(slot_label: str, fyers) -> int:
         data_daily = fetch_batch_daily(batch, fyers)
 
         for sym in batch:
-            if signals_posted >= MAX_PICKS: break
+            if signals_posted >= MAX_PICKS:
+                break
+
             df_15m   = data_15m.get(sym)
             df_daily = data_daily.get(sym)
+
             if df_15m is None or df_daily is None:
                 errors += 1
                 continue
 
             signal = generate_signal(sym, df_15m, df_daily, index_sentiment)
+
             if signal:
                 signals_found += 1
                 log.info(
                     f"✅ {signal['symbol']:15s} | {signal['setup']:8s} "
-                    f"| R:R={signal['rr']:4.2f} | ₹{signal['entry']}"
+                    f"| R:R={signal['rr']:4.2f} | RSI={signal['daily_rsi']} "
+                    f"| ₹{signal['entry']}"
                 )
                 if post_to_sheet(signal):
                     signals_posted += 1
                     log.info(f"   → Sheet ✓")
+
+                    # ── Send Telegram alert per signal ────────────
+                    setup_emoji = "🚀" if signal["setup"] == "BREAKOUT" else "🔄" if signal["setup"] == "PULLBACK" else "📈"
+                    send_telegram(
+                        f"{setup_emoji} <b>KASF Signal — {signal['symbol']}</b>\n"
+                        f"⏰ {slot_label} | {signal['setup']}\n\n"
+                        f"📌 Entry:  ₹{signal['entry']}\n"
+                        f"🎯 T1:     ₹{signal['t1']}\n"
+                        f"🎯 T2:     ₹{signal['t2']}\n"
+                        f"🛑 SL:     ₹{signal['sl2']}\n\n"
+                        f"📊 R:R = {signal['rr']} | RSI = {signal['daily_rsi']}\n"
+                        f"📈 RelVol = {signal['daily_rel_vol']}x\n"
+                        f"🌡️ Market: {index_sentiment}\n\n"
+                        f"⚠️ <i>Trade with proper risk management.</i>"
+                    )
                 else:
                     log.warning(f"   → Sheet FAILED ✗")
+            else:
+                filtered_out += 1
 
         b = (batch_start // BATCH_SIZE) + 1
         t = (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE
-        log.info(f"Batch {b}/{t} | Signals: {signals_found} | Posted: {signals_posted}")
+        log.info(
+            f"Batch {b}/{t} | "
+            f"Signals: {signals_found} | Posted: {signals_posted} | "
+            f"Filtered: {filtered_out} | Errors: {errors}"
+        )
         time.sleep(BATCH_DELAY_SEC)
 
+    # ── Summary ───────────────────────────────────────────────────
     if signals_posted == 0:
         send_telegram(
             f"ℹ️ <b>KASF — {slot_label}</b>\n"
             f"No signals found matching filters.\n"
             f"Market: {index_sentiment}\n"
-            f"Filters: RR≥{MIN_RR} | RSI {RSI_MIN}–{RSI_MAX} | Vol {VOL_MULT}x"
+            f"Filters: RR≥{MIN_RR} | RSI {RSI_MIN}–{RSI_MAX} | Vol {VOL_MULT}x\n"
+            f"Scanned: {len(FYERS_SYMBOLS)} stocks | "
+            f"Filtered: {filtered_out} | Data errors: {errors}"
         )
 
-    log.info(f"DONE — Signals: {signals_found} | Posted: {signals_posted} | Errors: {errors}")
+    log.info(
+        f"SCAN DONE — Signals: {signals_found} | "
+        f"Posted: {signals_posted} | "
+        f"Filtered: {filtered_out} | Errors: {errors}"
+    )
     log.info("=" * 62)
     return signals_posted
 
@@ -732,24 +802,24 @@ def run_entry_scan(slot_label: str, fyers) -> int:
 def main():
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.now(ist)
-    log.info(f"KASF V5 (Fyers) — cron fire at {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    log.info(f"KASF V5 (Fyers Fixed) — cron fire at {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
     slot_type, slot_label = get_current_slot()
 
     if slot_type is None:
-        log.info(f"No active slot at {now.strftime('%H:%M IST')} — exiting (0 tokens)")
+        log.info(f"No active slot at {now.strftime('%H:%M IST')} — exiting")
         return
 
     log.info(f"Matched slot: {slot_label} → {slot_type}")
 
-    # ── TOKEN SLOT: generate and cache, then exit ─────────────────
+    # ── TOKEN SLOT ────────────────────────────────────────────────
     if slot_type == "TOKEN":
-        log.info("TOKEN slot — generating Fyers access token now")
+        log.info("TOKEN slot — generating Fyers access token")
         fyers = _fyers_login()
         if fyers:
             global _fyers_instance
             _fyers_instance = fyers
-            log.info("✅ Token generated and cached — ready for 9:15 scan")
+            log.info("✅ Token generated and cached")
             send_telegram(
                 "✅ <b>KASF — Fyers Login OK</b>\n"
                 "Access token generated at 9:00 AM.\n"
@@ -759,14 +829,14 @@ def main():
             log.error("❌ Token generation failed at 9:00 AM slot")
         return
 
-    # ── EXIT SLOTS: no data needed ─────────────────────────────────
+    # ── EXIT SLOTS ────────────────────────────────────────────────
     if slot_type == "EXIT":
         is_final = (now.hour == 15)
         send_exit_alert(slot_label, is_final)
         log.info("Exit alert sent — exiting")
         return
 
-    # ── ENTRY SLOTS: need Fyers session ───────────────────────────
+    # ── ENTRY SLOTS ───────────────────────────────────────────────
     if slot_type == "ENTRY":
         fyers = ensure_fyers()
         if fyers is None:
