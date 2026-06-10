@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║       KASF V5 — NSE SCANNER  (V5 — FIXED EDITION v2)           ║
+║       KASF V5 — NSE SCANNER  (V5 — FIXED EDITION v3)           ║
 ║                                                                  ║
 ║  FIXES vs PREVIOUS:                                             ║
 ║   ✅ VOL_MULT lowered 2.0 → 1.5  (was blocking all signals)    ║
@@ -14,10 +14,11 @@
 ║   ✅ Detailed per-filter debug logging added                     ║
 ║   ✅ Signal rejection reason logged per stock                    ║
 ║                                                                  ║
-║  BUG FIX v2 (Errors: 332 — ALL stocks failing):                ║
-║   ✅ _fyers_history: date_format "1"→"0" (epoch mode)          ║
-║   ✅ _fyers_history: range_from/to now epoch integers           ║
-║   ✅ Per-stock error message now logged (first 3 per batch)     ║
+║  BUG FIX v3 (Errors: 332 — after-hours test run):               ║
+║   ✅ _epoch_range: range_to capped at last 15:30 IST close      ║
+║   ✅ Fyers returns empty candles if range_to > market close     ║
+║   ✅ _fyers_history: bad/empty response now logs at WARNING     ║
+║      (was DEBUG = silent in Railway — root cause now visible)   ║
 ║                                                                  ║
 ║  RAILWAY ENV VARS REQUIRED:                                      ║
 ║   FYERS_APP_ID      → e.g. "L9NY305RTW"  (without -100)        ║
@@ -398,11 +399,33 @@ def _epoch_range(days_back: int):
     Fyers history API requires date_format="0" (epoch mode).
     Using date strings (date_format="1") causes 'ok' response but
     empty candles for intraday resolutions — this was the Errors:332 bug.
+
+    IMPORTANT: range_to must not exceed market close (15:30 IST).
+    Fyers returns empty candles if range_to is after 15:30 IST for that day.
+
+    Rules:
+      - During market hours (09:00–15:30 IST): use now → live candles ✅
+      - After market close (>15:30 IST):       cap at 15:30 IST today ✅
+      - Pre-market (<09:00 IST):               use yesterday's 15:30 IST ✅
     """
     ist   = pytz.timezone("Asia/Kolkata")
     now   = datetime.now(ist)
-    start = now - timedelta(days=days_back)
-    return str(int(start.timestamp())), str(int(now.timestamp()))
+
+    market_open  = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    if market_open <= now <= market_close:
+        # During market hours — use current time so live candles are included
+        range_to = now
+    elif now > market_close:
+        # After market close — cap at today's 15:30 (Fyers rejects future range_to)
+        range_to = market_close
+    else:
+        # Pre-market (before 09:00) — use yesterday's 15:30
+        range_to = market_close - timedelta(days=1)
+
+    range_from = range_to - timedelta(days=days_back)
+    return str(int(range_from.timestamp())), str(int(range_to.timestamp()))
 
 
 def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFrame | None:
@@ -419,12 +442,12 @@ def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFra
         resp = fyers.history(data=data)
 
         if not resp or resp.get("s") != "ok":
-            log.debug(f"Fyers history bad response {symbol}: {resp}")
+            log.warning(f"Fyers history bad response {symbol}: {resp}")  # promoted: visible in Railway
             return None
 
         candles = resp.get("candles", [])
         if not candles:
-            log.debug(f"Fyers history empty candles {symbol}: resolution={resolution} days={days}")
+            log.warning(f"Fyers history empty candles {symbol}: resp_keys={list(resp.keys())} s={resp.get('s')} resolution={resolution} days={days}")  # promoted: visible in Railway
             return None
 
         df = pd.DataFrame(
@@ -439,7 +462,7 @@ def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFra
         return df if not df.empty else None
 
     except Exception as e:
-        log.debug(f"Fyers history error {symbol}: {e}")
+        log.warning(f"Fyers history exception {symbol}: {e}")  # promoted: visible in Railway
         return None
 
 
