@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║       KASF V5 — NSE SCANNER  (V5 — FIXED EDITION v2)           ║
+║       KASF V5 — NSE SCANNER  (V5 — FIXED EDITION v3)           ║
 ║                                                                  ║
 ║  FIXES vs PREVIOUS:                                             ║
 ║   ✅ VOL_MULT lowered 2.0 → 1.5  (was blocking all signals)    ║
@@ -18,6 +18,12 @@
 ║   ✅ _fyers_history: date_format "1"→"0" (epoch mode)          ║
 ║   ✅ _fyers_history: range_from/to now epoch integers           ║
 ║   ✅ Per-stock error message now logged (first 3 per batch)     ║
+║                                                                  ║
+║  BUG FIX v3 (Login FAILED — could not generate access token):  ║
+║   ✅ Step 1: app_id hardcoded back to "2" (was FYERS_APP_ID)   ║
+║   ✅ Step 3: access_token read directly from verify_pin resp   ║
+║      Fyers direct-login mode returns token at Step 3 itself,   ║
+║      no Step 4 auth_code exchange needed or possible.          ║
 ║                                                                  ║
 ║  RAILWAY ENV VARS REQUIRED:                                      ║
 ║   FYERS_APP_ID      → e.g. "L9NY305RTW"  (without -100)        ║
@@ -97,10 +103,10 @@ URL_AUTH_CODE  = _BASE_API    + "/validate-authcode"
 
 # ── KASF FILTER SETTINGS (FIXED — relaxed for real market conditions)
 ATR_MULT  = 1.5
-MIN_RR    = 1.5   # ✅ FIX: was 2.0 — too strict, valid setups were rejected
-RSI_MIN   = 40    # ✅ FIX: was 45 — too high on down/flat days
-RSI_MAX   = 75    # ✅ FIX: was 70 — slightly widened ceiling
-VOL_MULT  = 1.5   # ✅ FIX: was 2.0 — 2x volume rarely happens outside news stocks
+MIN_RR    = 1.5
+RSI_MIN   = 40
+RSI_MAX   = 75
+VOL_MULT  = 1.5
 PULL_PCT  = 0.003
 MAX_PICKS = 3
 
@@ -108,7 +114,7 @@ MAX_PICKS = 3
 CANDLE_INTERVAL  = "15"
 DAILY_INTERVAL   = "D"
 HISTORY_DAYS_15M = 5
-HISTORY_DAYS_D   = 20   # ✅ FIX: was 15 — need at least 20 for rolling(20) avg
+HISTORY_DAYS_D   = 20
 BATCH_SIZE       = 10
 BATCH_DELAY_SEC  = 1.5
 
@@ -309,7 +315,7 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         log.info("Fyers login — Step 1: send_login_otp")
         r1 = requests.post(
             URL_SEND_OTP,
-            json={"fy_id": FYERS_FY_ID, "app_id": FYERS_APP_ID},  # ✅ FIX: was hardcoded "2"
+            json={"fy_id": FYERS_FY_ID, "app_id": "2"},  # ✅ FIX v3: must be "2", not FYERS_APP_ID
             timeout=10
         ).json()
 
@@ -353,37 +359,14 @@ def _fyers_login() -> fyersModel.FyersModel | None:
             log.error(f"verify_pin failed: {r3}")
             return None
 
-        # verify_pin returns an auth_code, NOT a usable access_token directly
-        # We must exchange it via the token endpoint to get the real API access token
-        auth_code = r3["data"].get("authorization_code", "")
-        if not auth_code:
-            log.error(f"No authorization_code in verify_pin response: {r3}")
+        # ✅ FIX v3: Fyers direct-login mode returns access_token at Step 3 directly.
+        # No Step 4 auth_code exchange needed — that flow is for OAuth apps only.
+        access_token = r3["data"].get("access_token", "")
+        if not access_token:
+            log.error(f"No access_token in verify_pin response: {r3}")
             return None
 
-        log.info("Step 3 OK — auth_code obtained")
-
-        # ── Step 4: exchange auth_code for access_token ───────────
-        log.info("Fyers login — Step 4: exchange auth_code for access_token")
-        app_hash = hashlib.sha256(
-            f"{FYERS_CLIENT_ID}:{FYERS_SECRET_KEY}".encode()
-        ).hexdigest()
-
-        r4 = requests.post(
-            URL_TOKEN,
-            json={
-                "grant_type":  "authorization_code",
-                "appIdHash":   app_hash,
-                "code":        auth_code,
-            },
-            timeout=10
-        ).json()
-
-        if r4.get("s") != "ok" or "access_token" not in r4:
-            log.error(f"Token exchange failed: {r4}")
-            return None
-
-        access_token = r4["access_token"]
-        log.info("Step 4 OK — access_token obtained")
+        log.info("Step 3 OK — access_token obtained directly")
         log.info("✅ Fyers access token generated successfully")
 
         fyers = fyersModel.FyersModel(
@@ -436,9 +419,9 @@ def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFra
         data = {
             "symbol":      symbol,
             "resolution":  resolution,
-            "date_format": "0",          # ✅ FIX: "0"=epoch, "1"=date-string (was "1" → empty candles)
-            "range_from":  from_epoch,   # ✅ FIX: epoch int string
-            "range_to":    to_epoch,     # ✅ FIX: epoch int string
+            "date_format": "0",
+            "range_from":  from_epoch,
+            "range_to":    to_epoch,
             "cont_flag":   "1"
         }
         resp = fyers.history(data=data)
@@ -456,7 +439,6 @@ def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFra
             candles,
             columns=["datetime", "open", "high", "low", "close", "volume"]
         )
-        # epoch → datetime (Fyers returns epoch seconds when date_format="0")
         df["datetime"] = pd.to_datetime(df["datetime"], unit="s", utc=True)
         df["datetime"] = df["datetime"].dt.tz_convert("Asia/Kolkata")
         df.set_index("datetime", inplace=True)
@@ -476,7 +458,6 @@ def fetch_batch_15m(symbols: list, fyers) -> dict:
         if df is not None and len(df) >= 30:
             result[sym] = df
         elif errors_logged < 3:
-            # ✅ FIX: log first 3 failures per batch so we can see the actual error
             log.warning(f"15m fetch failed or thin: {sym} (rows={len(df) if df is not None else 0})")
             errors_logged += 1
         time.sleep(0.12)
@@ -494,12 +475,6 @@ def fetch_batch_daily(symbols: list, fyers) -> dict:
 
 
 def fetch_index_sentiment(fyers) -> str:
-    """
-    ✅ FIX: Increased history to 60 days for robust EMA20 calculation.
-    ✅ FIX: If data is insufficient, default to BULLISH (not NEUTRAL).
-         NEUTRAL was causing Telegram to show 'Market: NEUTRAL' and
-         the stricter bearish-mode trend filter was silently blocking signals.
-    """
     try:
         df = _fyers_history(fyers, FYERS_INDEX, DAILY_INTERVAL, 60)
 
@@ -634,27 +609,23 @@ def generate_signal(fyers_symbol: str, df_15m: pd.DataFrame,
         rr = (r1 - entry) / rr_denom
 
         # ── Filter 1: Trend ───────────────────────────────────────
-        # ✅ FIX: BEARISH mode uses VWAP anchor, BULLISH uses both EMAs
         if index_sentiment == "BEARISH":
             trend_ok = (c > e20) and (c > vwap_val)
         else:
             trend_ok = (c > e20) and (c > e50)
 
         # ── Filter 2: RSI ─────────────────────────────────────────
-        # ✅ FIX: RSI_MIN=40, RSI_MAX=75 (was 45–70)
         rsi_ok = RSI_MIN < rsi_val < RSI_MAX
 
         # ── Filter 3: Volume ──────────────────────────────────────
-        # ✅ FIX: Loosened per setup type
         if setup_type == "BREAKOUT":
-            vol_ok = v > vol_a * VOL_MULT          # 1.5x (was 2.0x)
+            vol_ok = v > vol_a * VOL_MULT
         elif setup_type == "PULLBACK":
-            vol_ok = v > vol_a * 0.6               # ✅ FIX: was 0.8x
+            vol_ok = v > vol_a * 0.6
         else:
-            vol_ok = v > vol_a * 1.0               # ✅ FIX: was 1.2x
+            vol_ok = v > vol_a * 1.0
 
         # ── Filter 4: Setup validity ──────────────────────────────
-        # ✅ FIX: Broadened — any of breakout / pullback / above VWAP / above EMA20
         setup_ok = breakout or is_pullback or (c > vwap_val) or (c > e20)
 
         # ── Combine & Log Rejections ──────────────────────────────
@@ -793,7 +764,6 @@ def run_entry_scan(slot_label: str, fyers) -> int:
                     signals_posted += 1
                     log.info(f"   → Sheet ✓")
 
-                    # ── Send Telegram alert per signal ────────────
                     setup_emoji = "🚀" if signal["setup"] == "BREAKOUT" else "🔄" if signal["setup"] == "PULLBACK" else "📈"
                     send_telegram(
                         f"{setup_emoji} <b>KASF Signal — {signal['symbol']}</b>\n"
@@ -821,7 +791,6 @@ def run_entry_scan(slot_label: str, fyers) -> int:
         )
         time.sleep(BATCH_DELAY_SEC)
 
-    # ── Summary ───────────────────────────────────────────────────
     if signals_posted == 0:
         send_telegram(
             f"ℹ️ <b>KASF — {slot_label}</b>\n"
@@ -857,7 +826,6 @@ def main():
 
     log.info(f"Matched slot: {slot_label} → {slot_type}")
 
-    # ── TOKEN SLOT ────────────────────────────────────────────────
     if slot_type == "TOKEN":
         log.info("TOKEN slot — generating Fyers access token")
         fyers = _fyers_login()
@@ -874,14 +842,12 @@ def main():
             log.error("❌ Token generation failed at 9:00 AM slot")
         return
 
-    # ── EXIT SLOTS ────────────────────────────────────────────────
     if slot_type == "EXIT":
         is_final = (now.hour == 15)
         send_exit_alert(slot_label, is_final)
         log.info("Exit alert sent — exiting")
         return
 
-    # ── ENTRY SLOTS ───────────────────────────────────────────────
     if slot_type == "ENTRY":
         fyers = ensure_fyers()
         if fyers is None:
