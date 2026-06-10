@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║       KASF V5 — NSE SCANNER  (V5 — FIXED EDITION)              ║
+║       KASF V5 — NSE SCANNER  (V5 — FIXED EDITION v2)           ║
 ║                                                                  ║
 ║  FIXES vs PREVIOUS:                                             ║
 ║   ✅ VOL_MULT lowered 2.0 → 1.5  (was blocking all signals)    ║
@@ -13,6 +13,11 @@
 ║   ✅ setup_ok condition broadened to include VWAP or EMA20      ║
 ║   ✅ Detailed per-filter debug logging added                     ║
 ║   ✅ Signal rejection reason logged per stock                    ║
+║                                                                  ║
+║  BUG FIX v2 (Errors: 332 — ALL stocks failing):                ║
+║   ✅ _fyers_history: date_format "1"→"0" (epoch mode)          ║
+║   ✅ _fyers_history: range_from/to now epoch integers           ║
+║   ✅ Per-stock error message now logged (first 3 per batch)     ║
 ║                                                                  ║
 ║  RAILWAY ENV VARS REQUIRED:                                      ║
 ║   FYERS_APP_ID      → e.g. "L9NY305RTW"  (without -100)        ║
@@ -387,38 +392,48 @@ def ensure_fyers() -> fyersModel.FyersModel | None:
 # ──────────────────────────────────────────────────────────────────
 # SECTION G — DATA FETCH (Fyers API)
 # ──────────────────────────────────────────────────────────────────
-def _date_range(days_back: int):
+def _epoch_range(days_back: int):
+    """
+    Return (range_from, range_to) as epoch integer strings.
+    Fyers history API requires date_format="0" (epoch mode).
+    Using date strings (date_format="1") causes 'ok' response but
+    empty candles for intraday resolutions — this was the Errors:332 bug.
+    """
     ist   = pytz.timezone("Asia/Kolkata")
-    today = datetime.now(ist).date()
-    start = today - timedelta(days=days_back)
-    return str(start), str(today)
+    now   = datetime.now(ist)
+    start = now - timedelta(days=days_back)
+    return str(int(start.timestamp())), str(int(now.timestamp()))
 
 
 def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFrame | None:
     try:
-        from_date, to_date = _date_range(days)
+        from_epoch, to_epoch = _epoch_range(days)
         data = {
             "symbol":      symbol,
             "resolution":  resolution,
-            "date_format": "1",
-            "range_from":  from_date,
-            "range_to":    to_date,
+            "date_format": "0",          # ✅ FIX: "0"=epoch, "1"=date-string (was "1" → empty candles)
+            "range_from":  from_epoch,   # ✅ FIX: epoch int string
+            "range_to":    to_epoch,     # ✅ FIX: epoch int string
             "cont_flag":   "1"
         }
         resp = fyers.history(data=data)
 
         if not resp or resp.get("s") != "ok":
+            log.debug(f"Fyers history bad response {symbol}: {resp}")
             return None
 
         candles = resp.get("candles", [])
         if not candles:
+            log.debug(f"Fyers history empty candles {symbol}: resolution={resolution} days={days}")
             return None
 
         df = pd.DataFrame(
             candles,
             columns=["datetime", "open", "high", "low", "close", "volume"]
         )
-        df["datetime"] = pd.to_datetime(df["datetime"])
+        # epoch → datetime (Fyers returns epoch seconds when date_format="0")
+        df["datetime"] = pd.to_datetime(df["datetime"], unit="s", utc=True)
+        df["datetime"] = df["datetime"].dt.tz_convert("Asia/Kolkata")
         df.set_index("datetime", inplace=True)
         df = df[["open", "high", "low", "close", "volume"]].dropna()
         return df if not df.empty else None
@@ -430,10 +445,15 @@ def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFra
 
 def fetch_batch_15m(symbols: list, fyers) -> dict:
     result = {}
+    errors_logged = 0
     for sym in symbols:
         df = _fyers_history(fyers, sym, CANDLE_INTERVAL, HISTORY_DAYS_15M)
         if df is not None and len(df) >= 30:
             result[sym] = df
+        elif errors_logged < 3:
+            # ✅ FIX: log first 3 failures per batch so we can see the actual error
+            log.warning(f"15m fetch failed or thin: {sym} (rows={len(df) if df is not None else 0})")
+            errors_logged += 1
         time.sleep(0.12)
     return result
 
