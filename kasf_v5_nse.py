@@ -295,48 +295,97 @@ def send_exit_alert(slot_label: str, is_final: bool):
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION F — FYERS TOTP AUTO LOGIN  (v5 — FINAL FIX)
+# SECTION F — FYERS TOTP AUTO LOGIN  (DEBUG VERSION)
 # ──────────────────────────────────────────────────────────────────
-#
-# ROOT CAUSE CONFIRMED (decoded JWT from logs):
-#   Step 3 verify_pin token has:
-#     "aud": ["x:0","x:1","x:2","d:1"]  ← d:1 = DATA SCOPE ✅
-#     "appType": ""                       ← no app bound
-#
-#   fyersModel sends: Authorization: CLIENT_ID-100:token
-#   Fyers rejects it because token "appType" is "" not "100"
-#   → code -16 on every data call
-#
-#   Step 4 token exchange ALSO fails (-16) because vagator auth_codes
-#   cannot be used with the validate-authcode OAuth endpoint.
-#   That endpoint only accepts browser-flow auth_codes.
-#
-# THE FIX:
-#   Bypass fyersModel entirely for data calls.
-#   Use raw requests.get() to https://api-t1.fyers.in/data/history
-#   with Authorization header = "fy_id:token"  (NOT "CLIENT_ID:token")
-#   This is what Fyers actually expects for vagator-issued tokens.
-#
-# The "fyers" object passed around is now just a token string wrapper.
-# Only _fyers_history uses it — no other function calls fyers.* methods.
-#
+
+DATA_URL = "https://api-t1.fyers.in/data/history"
+
+def _test_all_auth_formats(token: str):
+    """
+    Test every possible auth header format against Fyers data API.
+    Logs which one works so we can fix permanently.
+    """
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    params = {
+        "symbol":      "NSE:RELIANCE-EQ",
+        "resolution":  "D",
+        "date_format": "0",
+        "range_from":  str(int((now - timedelta(days=10)).timestamp())),
+        "range_to":    str(int(now.timestamp())),
+        "cont_flag":   "1"
+    }
+
+    formats = [
+        ("fy_id:token",          {FYERS_FY_ID: token}),
+        ("CLIENT_ID:token",      {FYERS_CLIENT_ID: token}),
+        ("Bearer token",         None),   # handled separately
+        ("token only",           None),   # handled separately
+        ("Authorization=token",  None),
+    ]
+
+    # Format 1: fy_id:token
+    r = requests.get(DATA_URL,
+        headers={"Authorization": f"{FYERS_FY_ID}:{token}"},
+        params=params, timeout=10).json()
+    log.info(f"AUTH TEST 1 [fy_id:token] → s={r.get('s')} code={r.get('code')} candles={len(r.get('candles',[]))}")
+
+    # Format 2: CLIENT_ID:token
+    r = requests.get(DATA_URL,
+        headers={"Authorization": f"{FYERS_CLIENT_ID}:{token}"},
+        params=params, timeout=10).json()
+    log.info(f"AUTH TEST 2 [CLIENT_ID:token] → s={r.get('s')} code={r.get('code')} candles={len(r.get('candles',[]))}")
+
+    # Format 3: Bearer token
+    r = requests.get(DATA_URL,
+        headers={"Authorization": f"Bearer {token}"},
+        params=params, timeout=10).json()
+    log.info(f"AUTH TEST 3 [Bearer token] → s={r.get('s')} code={r.get('code')} candles={len(r.get('candles',[]))}")
+
+    # Format 4: token only
+    r = requests.get(DATA_URL,
+        headers={"Authorization": token},
+        params=params, timeout=10).json()
+    log.info(f"AUTH TEST 4 [token only] → s={r.get('s')} code={r.get('code')} candles={len(r.get('candles',[]))}")
+
+    # Format 5: fyersModel default (what SDK does)
+    fyers_obj = fyersModel.FyersModel(
+        client_id=FYERS_CLIENT_ID, token=token, log_path=""
+    )
+    r = fyers_obj.history(data={
+        "symbol": "NSE:RELIANCE-EQ", "resolution": "D",
+        "date_format": "0",
+        "range_from": str(int((now - timedelta(days=10)).timestamp())),
+        "range_to":   str(int(now.timestamp())),
+        "cont_flag":  "1"
+    })
+    log.info(f"AUTH TEST 5 [fyersModel SDK] → s={r.get('s')} code={r.get('code')} candles={len(r.get('candles',[]))}")
+
+    # Format 6: fyersModel with empty client_id
+    fyers_obj2 = fyersModel.FyersModel(
+        client_id="", token=token, log_path=""
+    )
+    r = fyers_obj2.history(data={
+        "symbol": "NSE:RELIANCE-EQ", "resolution": "D",
+        "date_format": "0",
+        "range_from": str(int((now - timedelta(days=10)).timestamp())),
+        "range_to":   str(int(now.timestamp())),
+        "cont_flag":  "1"
+    })
+    log.info(f"AUTH TEST 6 [fyersModel empty client_id] → s={r.get('s')} code={r.get('code')} candles={len(r.get('candles',[]))}")
+
 
 class FyersDirectClient:
-    """
-    Thin wrapper that holds a token and makes raw HTTP calls to
-    Fyers data API. Bypasses fyersModel which sends wrong auth header
-    for vagator-issued tokens (appType="" tokens).
-    """
-    DATA_URL = "https://api-t1.fyers.in/data/history"
-
-    def __init__(self, fy_id: str, token: str):
-        self.fy_id = fy_id
-        self.token = token
+    """Raw HTTP client - auth format set after debug confirms which works."""
+    def __init__(self, fy_id: str, client_id: str, token: str):
+        self.fy_id     = fy_id
+        self.client_id = client_id
+        self.token     = token
 
     def history(self, data: dict) -> dict:
         try:
             resp = requests.get(
-                self.DATA_URL,
+                DATA_URL,
                 headers={"Authorization": f"{self.fy_id}:{self.token}"},
                 params=data,
                 timeout=15
@@ -353,68 +402,55 @@ def _fyers_login() -> FyersDirectClient | None:
         return None
 
     try:
-        # ── TOTP boundary: wait if close to 30s rollover ──────────
         sec = datetime.now().second % 30
         if sec > 25:
             wait = 31 - sec
-            log.info(f"TOTP boundary — waiting {wait}s before starting login")
+            log.info(f"TOTP boundary — waiting {wait}s")
             time.sleep(wait)
 
-        # ── Step 1: send_login_otp ────────────────────────────────
         log.info("Fyers login — Step 1: send_login_otp")
-        r1 = requests.post(
-            URL_SEND_OTP,
-            json={"fy_id": FYERS_FY_ID, "app_id": "2"},
-            timeout=10
-        ).json()
-
+        r1 = requests.post(URL_SEND_OTP,
+            json={"fy_id": FYERS_FY_ID, "app_id": "2"}, timeout=10).json()
         if r1.get("s") == "error" or "request_key" not in r1:
-            log.error(f"send_login_otp failed: {r1}")
-            return None
+            log.error(f"Step 1 failed: {r1}"); return None
         log.info("Step 1 OK")
 
-        # ── Step 2: verify_otp (TOTP) ─────────────────────────────
         log.info("Fyers login — Step 2: verify_otp (TOTP)")
-        totp_code = pyotp.TOTP(FYERS_TOTP_KEY).now()
-        r2 = requests.post(
-            URL_VERIFY_OTP,
-            json={"request_key": r1["request_key"], "otp": totp_code},
-            timeout=10
-        ).json()
-
+        r2 = requests.post(URL_VERIFY_OTP,
+            json={"request_key": r1["request_key"],
+                  "otp": pyotp.TOTP(FYERS_TOTP_KEY).now()}, timeout=10).json()
         if r2.get("s") == "error" or "request_key" not in r2:
-            log.error(f"verify_otp failed: {r2}")
-            return None
+            log.error(f"Step 2 failed: {r2}"); return None
         log.info("Step 2 OK")
 
-        # ── Step 3: verify_pin → get token with d:1 data scope ───
         log.info("Fyers login — Step 3: verify_pin")
-        r3 = requests.post(
-            URL_VERIFY_PIN,
-            json={
-                "request_key":   r2["request_key"],
-                "identity_type": "pin",
-                "identifier":    FYERS_PIN
-            },
-            timeout=10
-        ).json()
-
+        r3 = requests.post(URL_VERIFY_PIN,
+            json={"request_key": r2["request_key"],
+                  "identity_type": "pin",
+                  "identifier": FYERS_PIN}, timeout=10).json()
         if r3.get("s") == "error" or "data" not in r3:
-            log.error(f"verify_pin failed: {r3}")
-            return None
+            log.error(f"Step 3 failed: {r3}"); return None
 
-        # This token has aud: ["x:0","x:1","x:2","d:1"] — data scope included
         access_token = r3["data"].get("access_token", "")
         if not access_token:
-            log.error(f"No access_token in verify_pin response: {r3}")
-            return None
+            log.error(f"No access_token: {r3}"); return None
+        log.info("Step 3 OK — access_token obtained")
 
-        log.info("Step 3 OK — token with data scope obtained")
-        log.info("✅ Fyers login complete — using FyersDirectClient")
+        # ── RUN AUTH FORMAT DEBUG TEST ─────────────────────────────
+        log.info("=" * 62)
+        log.info("RUNNING AUTH FORMAT DEBUG — testing 6 header formats")
+        log.info("=" * 62)
+        _test_all_auth_formats(access_token)
+        log.info("=" * 62)
+        log.info("AUTH DEBUG DONE — check above for which format returned s=ok")
+        log.info("=" * 62)
 
-        # Return our custom client that uses fy_id:token auth header
-        # (NOT CLIENT_ID:token which fyersModel uses and Fyers rejects)
-        return FyersDirectClient(fy_id=FYERS_FY_ID, token=access_token)
+        log.info("✅ Login OK — proceeding with FyersDirectClient")
+        return FyersDirectClient(
+            fy_id=FYERS_FY_ID,
+            client_id=FYERS_CLIENT_ID,
+            token=access_token
+        )
 
     except Exception as e:
         log.error(f"Fyers login exception: {e}", exc_info=True)
@@ -467,7 +503,7 @@ def _fyers_history(fyers, symbol: str, resolution: str, days: int) -> pd.DataFra
         resp = fyers.history(data=data)
 
         if not resp or resp.get("s") != "ok":
-            log.warning(f"Fyers history bad response {symbol}: {resp}")
+            log.debug(f"Fyers history bad response {symbol}: {resp}")
             return None
 
         candles = resp.get("candles", [])
