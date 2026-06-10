@@ -310,7 +310,8 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         log.info("Fyers login — Step 1: send_login_otp")
         r1 = requests.post(
             URL_SEND_OTP,
-            json={"fy_id": FYERS_FY_ID, "app_id": "2"},
+            json={"fy_id": FYERS_FY_ID, "app_id": FYERS_APP_ID},
+
             timeout=10
         ).json()
 
