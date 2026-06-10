@@ -295,24 +295,58 @@ def send_exit_alert(slot_label: str, is_final: bool):
 
 
 # ──────────────────────────────────────────────────────────────────
-# SECTION F — FYERS TOTP AUTO LOGIN  (v4 — correct 4-step OAuth)
+# SECTION F — FYERS TOTP AUTO LOGIN  (v5 — FINAL FIX)
 # ──────────────────────────────────────────────────────────────────
 #
-# WHY v3 FAILED:
-#   verify_pin returns a "trading token" — it works for orders/positions
-#   but Fyers data/history API returns code -16 for it.
+# ROOT CAUSE CONFIRMED (decoded JWT from logs):
+#   Step 3 verify_pin token has:
+#     "aud": ["x:0","x:1","x:2","d:1"]  ← d:1 = DATA SCOPE ✅
+#     "appType": ""                       ← no app bound
 #
-# CORRECT FLOW:
-#   Step 1 — send_login_otp   → get request_key
-#   Step 2 — verify_otp       → confirm TOTP, get request_key2
-#   Step 3 — verify_pin       → get auth_code  (NOT access_token)
-#   Step 4 — POST /api/v3/token with appIdHash + auth_code
-#           → get REAL access_token that works for data + trading
+#   fyersModel sends: Authorization: CLIENT_ID-100:token
+#   Fyers rejects it because token "appType" is "" not "100"
+#   → code -16 on every data call
 #
-# Step 4 token is what fyersModel needs. Without it, ALL data calls
-# return {"code": -16, "message": "Could not authenticate the user"}.
+#   Step 4 token exchange ALSO fails (-16) because vagator auth_codes
+#   cannot be used with the validate-authcode OAuth endpoint.
+#   That endpoint only accepts browser-flow auth_codes.
 #
-def _fyers_login() -> fyersModel.FyersModel | None:
+# THE FIX:
+#   Bypass fyersModel entirely for data calls.
+#   Use raw requests.get() to https://api-t1.fyers.in/data/history
+#   with Authorization header = "fy_id:token"  (NOT "CLIENT_ID:token")
+#   This is what Fyers actually expects for vagator-issued tokens.
+#
+# The "fyers" object passed around is now just a token string wrapper.
+# Only _fyers_history uses it — no other function calls fyers.* methods.
+#
+
+class FyersDirectClient:
+    """
+    Thin wrapper that holds a token and makes raw HTTP calls to
+    Fyers data API. Bypasses fyersModel which sends wrong auth header
+    for vagator-issued tokens (appType="" tokens).
+    """
+    DATA_URL = "https://api-t1.fyers.in/data/history"
+
+    def __init__(self, fy_id: str, token: str):
+        self.fy_id = fy_id
+        self.token = token
+
+    def history(self, data: dict) -> dict:
+        try:
+            resp = requests.get(
+                self.DATA_URL,
+                headers={"Authorization": f"{self.fy_id}:{self.token}"},
+                params=data,
+                timeout=15
+            )
+            return resp.json()
+        except Exception as e:
+            return {"s": "error", "message": str(e)}
+
+
+def _fyers_login() -> FyersDirectClient | None:
     if not all([FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_FY_ID,
                 FYERS_PIN, FYERS_TOTP_KEY]):
         log.error("❌ One or more FYERS_* env vars missing — cannot login")
@@ -333,13 +367,10 @@ def _fyers_login() -> fyersModel.FyersModel | None:
             json={"fy_id": FYERS_FY_ID, "app_id": "2"},
             timeout=10
         ).json()
-        log.info(f"Step 1 response: {r1}")
 
         if r1.get("s") == "error" or "request_key" not in r1:
             log.error(f"send_login_otp failed: {r1}")
             return None
-
-        request_key = r1["request_key"]
         log.info("Step 1 OK")
 
         # ── Step 2: verify_otp (TOTP) ─────────────────────────────
@@ -347,97 +378,50 @@ def _fyers_login() -> fyersModel.FyersModel | None:
         totp_code = pyotp.TOTP(FYERS_TOTP_KEY).now()
         r2 = requests.post(
             URL_VERIFY_OTP,
-            json={"request_key": request_key, "otp": totp_code},
+            json={"request_key": r1["request_key"], "otp": totp_code},
             timeout=10
         ).json()
-        log.info(f"Step 2 response: {r2}")
 
         if r2.get("s") == "error" or "request_key" not in r2:
             log.error(f"verify_otp failed: {r2}")
             return None
-
-        request_key2 = r2["request_key"]
         log.info("Step 2 OK")
 
-        # ── Step 3: verify_pin → get auth_code ───────────────────
-        # IMPORTANT: This returns auth_code, NOT access_token.
-        # The auth_code alone cannot call data APIs — Step 4 is required.
+        # ── Step 3: verify_pin → get token with d:1 data scope ───
         log.info("Fyers login — Step 3: verify_pin")
         r3 = requests.post(
             URL_VERIFY_PIN,
             json={
-                "request_key":   request_key2,
+                "request_key":   r2["request_key"],
                 "identity_type": "pin",
                 "identifier":    FYERS_PIN
             },
             timeout=10
         ).json()
-        log.info(f"Step 3 response: {r3}")
 
         if r3.get("s") == "error" or "data" not in r3:
             log.error(f"verify_pin failed: {r3}")
             return None
 
-        # Extract auth_code from verify_pin response
-        # Field may be "authorization_code" or "access_token" depending on app type
-        r3_data    = r3.get("data", {})
-        auth_code  = (
-            r3_data.get("authorization_code")
-            or r3_data.get("auth_code")
-            or r3_data.get("access_token")  # fallback — some app types return token here
-            or ""
-        )
-        if not auth_code:
-            log.error(f"No auth_code in verify_pin response. Keys present: {list(r3_data.keys())}")
+        # This token has aud: ["x:0","x:1","x:2","d:1"] — data scope included
+        access_token = r3["data"].get("access_token", "")
+        if not access_token:
+            log.error(f"No access_token in verify_pin response: {r3}")
             return None
 
-        log.info("Step 3 OK — auth_code obtained")
+        log.info("Step 3 OK — token with data scope obtained")
+        log.info("✅ Fyers login complete — using FyersDirectClient")
 
-        # ── Step 4: exchange auth_code for real access_token ──────
-        # appIdHash = SHA-256( "CLIENT_ID-100:SECRET_KEY" )
-        # This is the token that works for BOTH data APIs and trading.
-        log.info("Fyers login — Step 4: token exchange")
-        app_id_hash = hashlib.sha256(
-            f"{FYERS_CLIENT_ID}:{FYERS_SECRET_KEY}".encode()
-        ).hexdigest()
-
-        r4 = requests.post(
-            URL_TOKEN,
-            json={
-                "grant_type":  "authorization_code",
-                "appIdHash":   app_id_hash,
-                "code":        auth_code,
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=10
-        ).json()
-        log.info(f"Step 4 response: {r4}")
-
-        if r4.get("s") != "ok" or "access_token" not in r4:
-            log.error(f"Token exchange failed: {r4}")
-            # ── FALLBACK: if Step 4 fails, try using auth_code directly
-            # Some Fyers app configurations skip the exchange step
-            log.warning("Step 4 failed — trying auth_code as direct token (fallback)")
-            access_token = auth_code
-        else:
-            access_token = r4["access_token"]
-            log.info("Step 4 OK — real access_token obtained")
-
-        log.info("✅ Fyers access token generated successfully")
-
-        fyers = fyersModel.FyersModel(
-            client_id = FYERS_CLIENT_ID,
-            token     = access_token,
-            log_path  = ""
-        )
-        return fyers
+        # Return our custom client that uses fy_id:token auth header
+        # (NOT CLIENT_ID:token which fyersModel uses and Fyers rejects)
+        return FyersDirectClient(fy_id=FYERS_FY_ID, token=access_token)
 
     except Exception as e:
         log.error(f"Fyers login exception: {e}", exc_info=True)
         return None
 
 
-def ensure_fyers() -> fyersModel.FyersModel | None:
+def ensure_fyers() -> FyersDirectClient | None:
     global _fyers_instance
     if _fyers_instance is not None:
         return _fyers_instance
